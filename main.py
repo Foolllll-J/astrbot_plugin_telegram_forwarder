@@ -9,24 +9,21 @@ from datetime import datetime
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from astrbot.api import logger, star
+from astrbot.api import logger, star, AstrBotConfig
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 class Main(star.Star):
-    def __init__(self, context: star.Context) -> None:
+    def __init__(self, context: star.Context, config: AstrBotConfig) -> None:
         super().__init__(context)
         self.context = context
+        self.config = config # AstrBot injects the config based on _conf_schema.json
         
         # Setup Directories
-        # We store config and data in AstrBot/data/plugins/astrbot_plugin_telegram_forwarder
+        # We store persistence data in AstrBot/data/plugins/astrbot_plugin_telegram_forwarder
         self.plugin_data_dir = os.path.join(get_astrbot_data_path(), "plugins", "astrbot_plugin_telegram_forwarder")
         if not os.path.exists(self.plugin_data_dir):
             os.makedirs(self.plugin_data_dir)
             
-        # Load Config
-        self.config_file = os.path.join(self.plugin_data_dir, "config.json")
-        self.config = self._load_config()
-        
         # Load Persistence Data (last_id)
         self.data_file = os.path.join(self.plugin_data_dir, "data.json")
         self.persistence = self._load_persistence()
@@ -42,40 +39,16 @@ class Main(star.Star):
         else:
             logger.warning("Telegram Forwarder is disabled in config.")
 
-    def _load_config(self) -> dict:
-        default_config = {
-            "enabled": True,
-            "bot_token": "",
-            "source_channel": "heyTchuang",
-            "target_channel": "", # Telegram target
-            "target_qq_group": 0, # QQ target
-            "check_interval": 60,
-            "proxy": "http://127.0.0.1:7897",
-            "napcat_api_url": "http://127.0.0.1:3000/send_group_msg"
-        }
-        
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, "r", encoding="utf-8") as f:
-                    user_config = json.load(f)
-                    # Simple merge
-                    for k, v in user_config.items():
-                        default_config[k] = v
-            except Exception as e:
-                logger.error(f"Failed to load config: {e}")
-        else:
-            # Write default config
-            with open(self.config_file, "w", encoding="utf-8") as f:
-                json.dump(default_config, f, indent=4, ensure_ascii=False)
-                
-        return default_config
-
     def _load_persistence(self) -> dict:
-        default_data = {"last_post_id": 0, "forwarded_ids": []}
+        default_data = {"channels": {}}
         if os.path.exists(self.data_file):
             try:
                 with open(self.data_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    # Simple migration check: if old format, ignore or reset
+                    if "last_post_id" in data:
+                        return default_data
+                    return data
             except Exception:
                 return default_data
         return default_data
@@ -86,31 +59,148 @@ class Main(star.Star):
 
     async def check_updates(self):
         """Periodic task to check for new messages"""
-        source = self.config.get("source_channel")
-        if not source:
+        channels_config = self.config.get("source_channels", [])
+        if not channels_config:
             return
 
+        for cfg in channels_config:
+            try:
+                # Parse "Channel|2025-01-01"
+                if "|" in cfg:
+                    channel_name, date_str = cfg.split("|", 1)
+                    channel_name = channel_name.strip()
+                    start_date = None
+                    try:
+                        # Parse date string to datetime (assuming midnight UTC for simplicity, or naive)
+                        start_date = datetime.strptime(date_str.strip(), "%Y-%m-%d")
+                        # Make it timezone-aware (UTC) to match get_channel_messages if needed
+                        # But scraping usually gives detailed offsets. Let's do a loose comparison inside.
+                    except ValueError:
+                        logger.error(f"Invalid date format in {cfg}. Use YYYY-MM-DD.")
+                        start_date = None
+                else:
+                    channel_name = cfg.strip()
+                    start_date = None
+                
+                await self._process_channel(channel_name, start_date)
+            except Exception as e:
+                logger.error(f"Error processing channel config {cfg}: {e}")
+            # Slight delay between channels
+            await asyncio.sleep(1)
+
+    async def _process_channel(self, channel: str, start_date: Optional[datetime] = None):
+        # Init channel persistence if needed
+        if channel not in self.persistence["channels"]:
+            self.persistence["channels"][channel] = {"last_post_id": 0, "forwarded_ids": []}
+            
+        channel_data = self.persistence["channels"][channel]
+        last_id = channel_data.get("last_post_id", 0)
+        forwarded = set(channel_data.get("forwarded_ids", []))
+
         try:
-            messages = await self.get_channel_messages(source, self.config.get("proxy"))
-            
-            last_id = self.persistence.get("last_post_id", 0)
-            forwarded = set(self.persistence.get("forwarded_ids", []))
-            
+            messages = await self.get_channel_messages(channel, self.config.get("proxy"))
+            if not messages:
+                return
+
+            # Feature: Cold Start / First Run
+            if last_id == 0:
+                if start_date:
+                    # Find first message >= start_date (loose comparison)
+                    target_id = 0
+                    found_target = False
+                    
+                    # Sort by ID (time)
+                    for m in messages:
+                        if not m["date"]: continue
+                        # Compare: Remove tzinfo for simpler comparison if needed, or handle offsets
+                        # scrape gives offset-aware. start_date is naive (from strptime).
+                        # Let's make start_date offset-aware (assume UTC or local? Telegram web usually UTC)
+                        # Quick fix: make m["date"] naive or start_date aware.
+                        msg_dt_naive = m["date"].replace(tzinfo=None)
+                        
+                        if msg_dt_naive >= start_date:
+                            # Found the first message on/after the date
+                            # We want to forward THIS message and all after it.
+                            # So we set last_id to the one BEFORE it.
+                            target_id = m["id"] - 1
+                            found_target = True
+                            logger.info(f"Found start date {start_date} match at msg {m['id']}. Starting from there.")
+                            break
+                    
+                    if found_target:
+                        self.persistence["channels"][channel]["last_post_id"] = target_id
+                        self._save_persistence()
+                        return # Return to allow next loop to pick it up normally? 
+                        # Actually if we assume next loop runs soon, we can just return.
+                        # But wait, if we return, we wait 60s. Better to continue logic below?
+                        # The logic below filters: `if m["id"] > last_id`.
+                        # If we set last_id = target - 1, then target > last_id is TRUE.
+                        # So we can just set local variable last_id and proceed!
+                        last_id = target_id
+                    else:
+                        # All messages are older than start_date? Or no dates found?
+                        # If all are older, we don't want any. Set to max_id.
+                        # If all are newer? (Unlikely unless date is very old).
+                        # If no dates found, fallback to max_id.
+                        max_id = max(m["id"] for m in messages)
+                        self.persistence["channels"][channel]["last_post_id"] = max_id
+                        self._save_persistence()
+                        logger.info(f"No match for start date {start_date} (or all older). Skipping history.")
+                        return 
+                else:
+                    # No start date, default to skipping history
+                    max_id = max(m["id"] for m in messages)
+                    self.persistence["channels"][channel]["last_post_id"] = max_id
+                    self._save_persistence()
+                    logger.info(f"Initialized channel {channel}. Setting baseline to message ID {max_id}. Future messages will be forwarded.")
+                    return
+
             # Filter new messages
             new_msgs = [m for m in messages if m["id"] > last_id and m["id"] not in forwarded]
             
             if not new_msgs:
                 return
 
+            filter_keywords = self.config.get("filter_keywords", [])
+            filter_regex = self.config.get("filter_regex", "")
+
             for msg in new_msgs:
                 try:
+                    # Content Filtering
+                    text_content = msg.get("text", "")
+                    
+                    # 1. Keyword Filter
+                    if filter_keywords:
+                        found_keyword = False
+                        for kw in filter_keywords:
+                            if kw and kw in text_content:
+                                logger.warning(f"Message {msg['id']} filtered by keyword: {kw}")
+                                found_keyword = True
+                                break
+                        if found_keyword:
+                            last_id = max(last_id, msg["id"])
+                            forwarded.add(msg["id"])
+                            continue
+
+                    # 2. Regex Filter
+                    if filter_regex:
+                        try:
+                            if re.search(filter_regex, text_content, re.IGNORECASE | re.DOTALL):
+                                logger.warning(f"Message {msg['id']} filtered by regex")
+                                last_id = max(last_id, msg["id"])
+                                forwarded.add(msg["id"])
+                                continue
+                        except Exception as e:
+                            logger.error(f"Invalid regex pattern: {e}")
+
                     # 1. Forward to Telegram
                     if self.config.get("target_channel") and self.config.get("bot_token"):
                         try:
+                            channel_display = f"From #{channel}:\n"
                             await self.send_message_tg(
                                 self.config["bot_token"],
                                 self.config["target_channel"],
-                                msg["text"],
+                                channel_display + msg["text"],
                                 msg["images"],
                                 self.config.get("proxy")
                             )
@@ -120,9 +210,10 @@ class Main(star.Star):
                     # 2. Forward to QQ
                     if self.config.get("target_qq_group"):
                         try:
+                            channel_display = f"From #{channel}:\n"
                             await self.send_to_qq(
                                 self.config["target_qq_group"],
-                                msg["text"],
+                                channel_display + msg["text"],
                                 msg["images"]
                             )
                         except Exception as e:
@@ -133,19 +224,19 @@ class Main(star.Star):
                     if msg["id"] > last_id:
                         last_id = msg["id"]
                     
-                    logger.info(f"Forwarded post {msg['id']}")
+                    logger.info(f"Forwarded post {msg['id']} from {channel}")
                     await asyncio.sleep(2) # Rate limit
 
                 except Exception as e:
                     logger.error(f"Error processing message {msg['id']}: {e}")
 
             # Save state
-            self.persistence["last_post_id"] = last_id
-            self.persistence["forwarded_ids"] = list(forwarded)[-500:]
+            self.persistence["channels"][channel]["last_post_id"] = last_id
+            self.persistence["channels"][channel]["forwarded_ids"] = list(forwarded)[-500:]
             self._save_persistence()
 
         except Exception as e:
-            logger.error(f"Check updates failed: {e}")
+            logger.error(f"Check updates failed for {channel}: {e}")
 
     # ================= Logic Ported from forwarder.py =================
 
@@ -161,7 +252,17 @@ class Main(star.Star):
         
         async with httpx.AsyncClient(proxy=proxy, timeout=30, follow_redirects=True) as client:
             resp = await client.get(url, headers=headers)
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                logger.error(f"HTTP Error for {channel}: {e}")
+                return []
+            
+            # Check for redirect (Telegram redirects /s/ to / if sensitive/restricted)
+            if "/s/" not in str(resp.url):
+                logger.warning(f"Channel '{channel}' redirects to {resp.url}. This usually means the channel is restricted (sensitive/porn/piracy) and hides the public preview. The plugin cannot scrape it.")
+                return []
+
             html = resp.text
         
         messages = []
@@ -229,17 +330,32 @@ class Main(star.Star):
                 if img.startswith("//"): img = "https:" + img
                 images.append(img)
             
+            # Extract date
+            date_pattern = r'<time datetime="([^"]+)"'
+            date_match = re.search(date_pattern, msg_html)
+            msg_date = None
+            if date_match:
+                try:
+                    # ISO8601: 2025-01-31T05:24:25+00:00
+                    dt_str = date_match.group(1)
+                    # Parse to datetime object
+                    from datetime import datetime # Added import here for self-contained snippet
+                    msg_date = datetime.fromisoformat(dt_str)
+                except:
+                    pass
+
             if text or images:
                 messages.append({
                     "id": msg_id,
                     "text": text,
                     "images": images,
-                    "post_id": post_id
+                    "post_id": post_id,
+                    "date": msg_date
                 })
         
         return sorted(messages, key=lambda x: x["id"])
 
-    async def send_message_tg(self, bot_token: str, chat_id: str, text: str, images: list, proxy: str = None):
+    async def send_message_tg(self, bot_token: str, chat_id: str, text: str, images: list, proxy: Optional[str] = None):
         """Send to Telegram"""
         base_url = f"https://api.telegram.org/bot{bot_token}"
         async with httpx.AsyncClient(proxy=proxy, timeout=120, follow_redirects=True) as client:

@@ -1,0 +1,66 @@
+{
+    "enabled": {
+        "description": "是否启用插件",
+        "type": "bool",
+        "default": true
+    },
+    "source_channels": {
+        "description": "源频道用户名列表",
+        "type": "list",
+        "item_type": "string",
+        "hint": "不需要加 @，例如 `GoogleNews`。必须是公开频道。",
+        "default": [
+            "heyTchuang"
+        ],
+        "obvious_hint": true
+    },
+    "check_interval": {
+        "description": "检测间隔(秒)",
+        "type": "int",
+        "hint": "每隔多少秒检查一次新消息",
+        "default": 60
+    },
+    "proxy": {
+        "description": "代理地址",
+        "type": "string",
+        "hint": "访问 Telegram 需要代理，例如 http://127.0.0.1:7897",
+        "default": "http://127.0.0.1:7897"
+    },
+    "bot_token": {
+        "description": "TG Bot Token",
+        "type": "string",
+        "hint": "转发到 Telegram 目标频道时需要，从 @BotFather 获取",
+        "default": ""
+    },
+    "target_channel": {
+        "description": "TG 目标频道 ID",
+        "type": "string",
+        "hint": "接收消息的频道，例如 @my_channel_name 或 -100xxxxxxx",
+        "default": ""
+    },
+    "target_qq_group": {
+        "description": "QQ 目标群号",
+        "type": "int",
+        "hint": "转发到 QQ 群时填写群号，0 表示不转发到 QQ",
+        "default": 0
+    },
+    "napcat_api_url": {
+        "description": "NapCat API 地址",
+        "type": "string",
+        "hint": "NapCat 的 HTTP API 地址",
+        "default": "http://127.0.0.1:3000/send_group_msg"
+    },
+    "filter_keywords": {
+        "type": "list",
+        "item_type": "string",
+        "description": "过滤关键词",
+        "default": [],
+        "hint": "包含这些关键词的消息将被自动丢弃（例如 VPN, NSFW）"
+    },
+    "filter_regex": {
+        "type": "string",
+        "description": "正则过滤",
+        "default": "",
+        "hint": "Python 正则表达式过滤。留空则不启用。"
+    }
+}
