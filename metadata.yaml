@@ -1,5 +1,5 @@
 name: astrbot_plugin_telegram_forwarder
-desc: Forward public Telegram channel messages to QQ/Telegram without user account.
+desc: Forward Telegram channel messages to QQ/Telegram using Client API.
 author: HSJ-BanFan
-version: 0.1.1
+version: 0.2.0
 display_name: Telegram Forwarder

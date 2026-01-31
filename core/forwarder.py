@@ -44,9 +44,9 @@ class Forwarder:
             except Exception as e:
                 logger.error(f"Error checking {cfg}: {e}")
             
-            # Rate Limiting / Do Not Disturb
-            delay = self.config.get("forward_delay", 2)
-            await asyncio.sleep(delay)
+            # Rate Limiting is now handled per-message in _process_channel
+            # delay = self.config.get("forward_delay", 2)
+            # await asyncio.sleep(delay)
 
     async def _process_channel(self, channel_name: str, start_date: Optional[datetime]):
         if not self.storage.get_channel_data(channel_name).get("last_post_id"):
@@ -121,6 +121,12 @@ class Forwarder:
                     # Update persistence IMMEDIATELY after each message
                     final_last_id = max(final_last_id, msg.id)
                     self.storage.update_last_id(channel_name, final_last_id)
+                    
+                    # Rate Limiting / Do Not Disturb (Per Message)
+                    delay = self.config.get("forward_delay", 0)
+                    if delay > 0:
+                        logger.info(f"Rate limit: sleeping {delay}s...")
+                        await asyncio.sleep(delay)
                     
                 except Exception as e:
                     logger.error(f"Failed to process msg {msg.id}: {e}")
