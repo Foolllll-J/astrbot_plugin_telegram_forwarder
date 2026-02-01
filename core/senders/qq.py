@@ -14,10 +14,19 @@ class QQSender:
     """
     负责将消息转发到 QQ 群 (支持合并相册)
     """
+    """
+    负责将消息转发到 QQ 群 (支持合并相册)
+    """
     def __init__(self, config: AstrBotConfig, downloader: MediaDownloader, uploader: FileUploader):
         self.config = config
         self.downloader = downloader
         self.uploader = uploader
+        self._group_locks = {} # simple dict
+
+    def _get_lock(self, group_id):
+        if group_id not in self._group_locks:
+            self._group_locks[group_id] = asyncio.Lock()
+        return self._group_locks[group_id]
 
     async def send(self, msgs: List[Message], src_channel: str):
         """
@@ -92,29 +101,34 @@ class QQSender:
             async with httpx.AsyncClient() as http:
                  for gid in qq_groups:
                      if not gid: continue
-                     try:
-                        # 检查是否有 record 节点 (语音特殊处理)
-                        has_record = any(node.get("type") == "record" for node in message)
-                        
-                        if has_record:
-                            # 语音拆分发送逻辑
-                            text_nodes = [node for node in message if node.get("type") == "text"]
-                            if text_nodes:
-                                await http.post(url, json={"group_id": gid, "message": text_nodes}, timeout=30)
-                                await asyncio.sleep(1)
-
-                            record_nodes = [node for node in message if node.get("type") == "record"]
-                            for rec_node in record_nodes:
-                                await http.post(url, json={"group_id": gid, "message": [rec_node]}, timeout=30)
+                     # 获取该群的锁，确保消息发送（包含语音拆分）的原子性
+                     lock = self._get_lock(gid)
+                     async with lock:
+                        try:
+                            # 检查是否有 record 节点 (语音特殊处理)
+                            has_record = any(node.get("type") == "record" for node in message)
                             
-                            logger.info(f"Forwarded album/msg to QQ group {gid} (Split)")
-                        else:
-                            # 普通/相册消息直接发送
-                            await http.post(url, json={"group_id": gid, "message": message}, timeout=30)
-                            logger.info(f"Forwarded album ({len(msgs)} msgs) to QQ group {gid}")
+                            if has_record:
+                                # 语音拆分发送逻辑
+                                text_nodes = [node for node in message if node.get("type") == "text"]
+                                if text_nodes:
+                                    await http.post(url, json={"group_id": gid, "message": text_nodes}, timeout=60)
+                                    await asyncio.sleep(1)
 
-                     except Exception as e:
-                        logger.error(f"Failed to send to QQ group {gid}: {e}")
+                                record_nodes = [node for node in message if node.get("type") == "record"]
+                                for rec_node in record_nodes:
+                                    await http.post(url, json={"group_id": gid, "message": [rec_node]}, timeout=60)
+                                
+                                logger.info(f"Forwarded album/msg to QQ group {gid} (Split)")
+                            else:
+                                # 普通/相册消息直接发送
+                                await http.post(url, json={"group_id": gid, "message": message}, timeout=60)
+                                logger.info(f"Forwarded album ({len(msgs)} msgs) to QQ group {gid}")
+
+                        except Exception as e:
+                            import traceback
+                            logger.error(f"Failed to send to QQ group {gid}: {type(e).__name__}: {e}")
+                            # logger.error(traceback.format_exc()) # Open if debugging needed
 
         except Exception as e:
             logger.error(f"QQ Forward Error: {e}")

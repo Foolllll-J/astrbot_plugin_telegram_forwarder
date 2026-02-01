@@ -51,6 +51,16 @@ class Forwarder:
         
         # 启动时清理孤儿文件
         self._cleanup_orphaned_files()
+        
+        # 任务锁，防止重入 (Key: ChannelName)
+        self._channel_locks = {}
+        # 上次检查时间 (Key: ChannelName)
+        self._channel_last_check = {}
+
+    def _get_channel_lock(self, channel_name):
+        if channel_name not in self._channel_locks:
+            self._channel_locks[channel_name] = asyncio.Lock()
+        return self._channel_locks[channel_name]
 
     async def check_updates(self):
         """
@@ -67,27 +77,54 @@ class Forwarder:
             try:
                 channel_name = cfg
                 start_date = None
+                interval = 0
 
-                # 解析频道配置（支持日期过滤）
-                # 格式：channel_name|YYYY-MM-DD
+                # 解析频道配置
+                # 格式：channel_name | start_date | interval
+                # 示例：xiaoshuwu | 2025-01-01 | 60
                 if "|" in cfg:
-                    channel_name, date_str = cfg.split("|", 1)
-                    channel_name = channel_name.strip()
-                    try:
-                         # 将字符串转换为时区感知的 datetime 对象
-                         start_date = datetime.strptime(date_str.strip(), "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                    except:
-                        pass
+                    parts = [p.strip() for p in cfg.split("|")]
+                    channel_name = parts[0]
+                    
+                    for part in parts[1:]:
+                        if not part: continue
+                        # 尝试解析为日期
+                        if "-" in part and not start_date:
+                            try:
+                                start_date = datetime.strptime(part, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                                continue
+                            except:
+                                pass
+                        
+                        # 尝试解析为间隔(整数)
+                        if part.isdigit():
+                            interval = int(part)
                 else:
                     channel_name = cfg.strip()
 
-                # 处理该频道
-                await self._process_channel(channel_name, start_date)
+                # 检查间隔
+                now = datetime.now().timestamp()
+                last_check = self._channel_last_check.get(channel_name, 0)
+                if now - last_check < interval:
+                    return # 还没到时间
+                
+                # 获取该频道的锁
+                lock = self._get_channel_lock(channel_name)
+                
+                # 如果锁被占用，跳过本次检查（非阻塞）
+                if lock.locked():
+                    return
+                
+                async with lock:
+                    self._channel_last_check[channel_name] = now
+                    # 处理该频道
+                    await self._process_channel(channel_name, start_date)
+                    
             except Exception as e:
                 # 记录错误但继续处理其他频道
                 logger.error(f"Error checking {cfg}: {e}")
 
-        # 创建并执行任务
+        # 并行执行所有频道的检查任务
         tasks = [process_one(cfg) for cfg in channels_config]
         if tasks:
             await asyncio.gather(*tasks)
