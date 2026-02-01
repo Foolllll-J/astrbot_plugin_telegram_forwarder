@@ -30,13 +30,12 @@ class Main(star.Star):
 
     继承自 AstrBot 的 star.Star 基类，实现插件的生命周期管理。
     """
-    def __init__(self, context: star.Context, config: AstrBotConfig) -> None:
+    def __init__(self, context: star.Context) -> None:
         """
         插件初始化
 
         Args:
             context: AstrBot 上下文对象，提供框架级别的API访问
-            config: 插件配置对象，包含 api_id、api_hash、代理设置等
 
         初始化流程：
         1. 设置数据持久化目录
@@ -46,7 +45,7 @@ class Main(star.Star):
         """
         super().__init__(context)
         self.context = context
-        self.config = config
+        self.config = context.config
 
         # ========== 设置数据目录 ==========
         try:
