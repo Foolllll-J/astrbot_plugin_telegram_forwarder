@@ -47,6 +47,7 @@ class Forwarder:
         self.client_wrapper = client_wrapper
         self.client = client_wrapper.client  # 快捷访问
         self.plugin_data_dir = plugin_data_dir
+        self.proxy_url = config.get("proxy")  # Initialize proxy_url
 
 
 

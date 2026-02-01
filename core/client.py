@@ -93,9 +93,9 @@ class TelegramClientWrapper:
                 auto_reconnect=True,
                 # Optimization: Hardcode DC IPs to avoid DNS issues and potentially improve speed
                 # DC 1: Miami, DC 2: Amsterdam, DC 3: Miami, DC 4: Amsterdam, DC 5: Singapore
-                system_version="4.16.30-vxCustom"
+                # system_version="4.16.30-vxCustom"
             )
-            self.client.session.set_dc(2, '149.154.167.50', 443)
+            # self.client.session.set_dc(2, '149.154.167.50', 443)
 
         else:
             # 配置不完整时输出警告

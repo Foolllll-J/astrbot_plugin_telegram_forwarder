@@ -142,24 +142,39 @@ class Main(star.Star):
             此方法由 AstrBot 框架在插件卸载时调用
             使用 shutdown(wait=False) 避免阻塞，快速释放资源
         """
-        # ========== 停止定时调度器 ==========
-        # wait=False: 不等待正在执行的任务完成，立即停止
+    async def terminate(self):
+        """
+        插件终止时的清理工作
+        """
+        logger.info("[Telegram Forwarder] Terminating plugin...")
+        
+        # 1. Stop Scheduler
         if self.scheduler.running:
+            logger.info("[Telegram Forwarder] Shutting down scheduler...")
             self.scheduler.shutdown(wait=False)
+            logger.info("[Telegram Forwarder] Scheduler shutdown complete.")
 
-        # ========== 等待启动任务完成 ==========
-        # 如果 _start_task 还在运行，等待其完成（最多5秒）
-        # 这确保在断开连接前，客户端已完全启动
+        # 2. Wait for Start Task
         if self._start_task:
+            logger.info("[Telegram Forwarder] Waiting for start task...")
             try:
-                await asyncio.wait_for(self._start_task, timeout=5.0)
+                await asyncio.wait_for(self._start_task, timeout=3.0)
             except asyncio.TimeoutError:
-                # 超时则取消任务，强制继续清理流程
+                logger.warning("[Telegram Forwarder] Start task timed out, cancelling...")
                 self._start_task.cancel()
+            except Exception as e:
+                logger.error(f"[Telegram Forwarder] Error waiting for start task: {e}")
 
-        # ========== 断开 Telegram 客户端 ==========
-        # 优雅地关闭连接，释放会话文件
+        # 3. Disconnect Client
         if self.client_wrapper.client:
-            await self.client_wrapper.client.disconnect()
+            logger.info("[Telegram Forwarder] Disconnecting client...")
+            try:
+                # Force disconnect with short timeout
+                await asyncio.wait_for(self.client_wrapper.client.disconnect(), timeout=3.0)
+                logger.info("[Telegram Forwarder] Client disconnected.")
+            except asyncio.TimeoutError:
+                logger.warning("[Telegram Forwarder] Client disconnect timed out!")
+            except Exception as e:
+                logger.error(f"[Telegram Forwarder] Error disconnecting client: {e}")
 
-        logger.info("Telethon Plugin Stopped")
+        logger.info("[Telegram Forwarder] Plugin Stopped")
