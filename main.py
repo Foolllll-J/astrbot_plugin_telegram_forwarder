@@ -49,9 +49,12 @@ class Main(star.Star):
 
         # ========== 设置数据目录 ==========
         try:
+            from pathlib import Path
             from astrbot.core.utils.astrbot_path import get_astrbot_data_path
             # data/plugin_data/astrbot_plugin_telegram_forwarder
-            self.plugin_data_dir = str(get_astrbot_data_path() / "plugin_data" / "astrbot_plugin_telegram_forwarder")
+            # Ensure get_astrbot_data_path() return value is treated as Path
+            base_data_path = Path(get_astrbot_data_path())
+            self.plugin_data_dir = str(base_data_path / "plugin_data" / "astrbot_plugin_telegram_forwarder")
         except ImportError:
             # Fallback for older versions
             logger.warning("Could not import get_astrbot_data_path, using default StarTools path.")
