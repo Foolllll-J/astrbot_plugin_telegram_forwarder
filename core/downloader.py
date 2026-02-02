@@ -42,24 +42,33 @@ class MediaDownloader:
                 return local_files
 
         # ========== 判断是否应该下载 ==========
-        # 支持图片和音频
+        # 支持图片、音频和视频
         is_photo = hasattr(msg, "photo") and msg.photo
+        is_video = False
         is_audio = False
 
+        # 检查视频
+        if msg.video:
+            is_video = True
+        
         # 检查音频/语音
         if msg.file and msg.file.mime_type:
             mime = msg.file.mime_type
             if mime.startswith("audio/") or mime == "application/ogg":
                 is_audio = True
+            elif mime.startswith("video/"):
+                is_video = True
 
-        should_download = is_photo or is_audio
+        should_download = is_photo or is_audio or is_video
 
-        # 检查是否为图片文档 (原图发送)
+        # 检查是否为图片/视频文档 (原文件发送)
         if not should_download and msg.file and msg.file.mime_type:
-            if msg.file.mime_type.startswith("image/"):
+            if msg.file.mime_type.startswith("image/") or msg.file.mime_type.startswith("video/"):
                 should_download = True
 
         if should_download:
+            media_type = "Photo" if is_photo else ("Video" if is_video else "Audio")
+            logger.info(f"Detected {media_type} in msg {msg.id}, starting download...")
             # 定义进度回调函数
             def progress_callback(current, total):
                 if total > 0:
