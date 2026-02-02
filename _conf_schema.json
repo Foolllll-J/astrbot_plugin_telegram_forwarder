@@ -140,8 +140,8 @@
     "napcat_api_url": {
         "description": "NapCat API 地址",
         "type": "string",
-        "hint": "NapCat 的 HTTP API 地址",
-        "default": "http://127.0.0.1:3000/send_group_msg"
+        "hint": "NapCat 的 HTTP API 地址。若设为 localhost，则使用 AstrBot 内部接口发送（推荐）。",
+        "default": "localhost"
     },
     "filter_keywords": {
         "type": "list",

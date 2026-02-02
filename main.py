@@ -137,7 +137,7 @@ class Main(star.Star):
 
         # Forwarder: 消息转发核心逻辑，处理消息过滤、媒体下载、多平台发送
         self.forwarder = Forwarder(
-            self.config, self.storage, self.client_wrapper, self.plugin_data_dir
+            self.context, self.config, self.storage, self.client_wrapper, self.plugin_data_dir
         )
 
         # ========== 初始化定时任务调度器 ==========
@@ -193,6 +193,22 @@ class Main(star.Star):
                 logger.info(
                     f"Monitoring channels: {self.config.get('source_channels')}"
                 )
+
+        # 捕获 QQ 平台实例变量初始化
+        self.bot = None
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP | filter.PlatformAdapterType.QQOFFICIAL)
+    async def on_qq_message(self, event: AstrMessageEvent):
+        """通过接收到的消息动态捕获并确认 QQ 平台 ID"""
+        umo = event.unified_msg_origin
+        if ":" in umo:
+            platform_id = umo.split(":")[0]
+            # 如果尚未获取到 bot，或者 platform_id 发生了变化
+            if not self.bot or getattr(self.forwarder.qq_sender, "platform_id", None) != platform_id:
+                self.bot = event.bot
+                if hasattr(self, "forwarder") and hasattr(self.forwarder, "qq_sender"):
+                    self.forwarder.qq_sender.platform_id = platform_id
+                logger.info(f"通过消息事件成功捕获/更新 QQ platform_id: {platform_id}")
 
     async def terminate(self):
         """

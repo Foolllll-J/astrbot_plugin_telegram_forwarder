@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Optional, List
 from telethon.tl.types import Message, PeerUser
 
-from astrbot.api import logger, AstrBotConfig
+from astrbot.api import logger, AstrBotConfig, star
 from ..common.storage import Storage
 from .client import TelegramClientWrapper
 from .downloader import MediaDownloader
@@ -37,11 +37,13 @@ class Forwarder:
 
     def __init__(
         self,
+        context: star.Context,
         config: AstrBotConfig,
         storage: Storage,
         client_wrapper: TelegramClientWrapper,
         plugin_data_dir: str,
     ):
+        self.context = context
         self.config = config
         self.storage = storage
         self.client_wrapper = client_wrapper
@@ -55,7 +57,7 @@ class Forwarder:
 
         # 初始化发送器
         self.tg_sender = TelegramSender(self.client, config)
-        self.qq_sender = QQSender(config, self.downloader, self.uploader)
+        self.qq_sender = QQSender(self.context, config, self.downloader, self.uploader)
 
         # 启动时清理孤儿文件
         self._cleanup_orphaned_files()
