@@ -14,6 +14,7 @@ Telegram 消息转发插件 - 主入口
 import asyncio
 import os
 import shutil
+import filecmp
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from astrbot.api import logger, star, AstrBotConfig
@@ -95,6 +96,7 @@ class Main(star.Star):
         # Storage: 负责持久化存储频道消息ID
         self.storage = Storage(os.path.join(self.plugin_data_dir, "data.json"))
 
+
         # ========== 处理上传的 Session 文件 ==========
         session_files = self.config.get("telegram_session", [])
         if session_files and isinstance(session_files, list) and len(session_files) > 0:
@@ -104,11 +106,29 @@ class Main(star.Star):
             if os.path.exists(full_uploaded_path):
                 target_session_path = os.path.join(self.plugin_data_dir, "user_session.session")
                 
-                try:
-                    shutil.copy2(full_uploaded_path, target_session_path)
-                    logger.info(f"Telegram Forwarder: 已从上传配置同步会话文件: {target_session_path} (源: {full_uploaded_path})")
-                except Exception as e:
-                    logger.error(f"Telegram Forwarder: 同步会话文件失败: {e}")
+                should_copy = True
+                if os.path.exists(target_session_path):
+                    try:
+                        if filecmp.cmp(full_uploaded_path, target_session_path, shallow=False):
+                            should_copy = False
+                            logger.info("Telegram Forwarder: Session file unchanged, skipping sync to avoid file lock.")
+                    except Exception as e:
+                        logger.warning(f"Failed to compare session files: {e}")
+
+                if should_copy:
+                    try:
+                        shutil.copy2(full_uploaded_path, target_session_path)
+                        logger.info(f"Telegram Forwarder: 已从上传配置同步会话文件: {target_session_path} (源: {full_uploaded_path})")
+                        
+                        # Clear cache if we updated the file
+                        from .core.client import get_client_cache
+                        cache = get_client_cache()
+                        if target_session_path in cache:
+                            logger.warning("Session file updated. Clearing cache to force reconnection.")
+                            del cache[target_session_path]
+                            
+                    except Exception as e:
+                        logger.error(f"Telegram Forwarder: 同步会话文件失败 (可能被占用): {e}")
             else:
                 logger.warning(f"Telegram Forwarder: 配置中的会话文件路径不存在: {full_uploaded_path}")
 
@@ -177,6 +197,11 @@ class Main(star.Star):
     async def terminate(self):
         """
         插件终止时的清理工作
+
+        优化策略：
+        1. 保持客户端连接在全局缓存中，避免插件重载时重新连接
+        2. 只有在完全停止时才断开连接（通过配置参数控制）
+        3. 配置保存时只需停止调度器，客户端保持连接状态
         """
         logger.info("[Telegram Forwarder] Terminating plugin...")
 
@@ -186,19 +211,29 @@ class Main(star.Star):
             self.scheduler.shutdown(wait=False)
             logger.info("[Telegram Forwarder] Scheduler shutdown complete.")
 
-        # 2. Disconnect Client
+        # 2. Client Disconnect Strategy
+        # 如果配置了 force_disconnect=True，则强制断开连接
+        # 否则保持连接在缓存中，以便下次重载时快速启动
+        force_disconnect = self.config.get("force_disconnect", False)
+
         if self.client_wrapper.client:
-            logger.info("[Telegram Forwarder] Disconnecting client...")
-            try:
-                # Force disconnect with short timeout
-                await asyncio.wait_for(
-                    self.client_wrapper.client.disconnect(), timeout=3.0
-                )
-                logger.info("[Telegram Forwarder] Client disconnected.")
-            except asyncio.TimeoutError:
-                logger.warning("[Telegram Forwarder] Client disconnect timed out!")
-            except Exception as e:
-                logger.error(f"[Telegram Forwarder] Error disconnecting client: {e}")
+            if force_disconnect:
+                logger.info("[Telegram Forwarder] Force disconnecting client...")
+                try:
+                    await asyncio.wait_for(
+                        self.client_wrapper.client.disconnect(), timeout=1.0
+                    )
+                    logger.info("[Telegram Forwarder] Client disconnected.")
+                    # 清理缓存
+                    from .core.client import TelegramClientWrapper
+                    TelegramClientWrapper.clear_cache()
+                except asyncio.TimeoutError:
+                    logger.warning("[Telegram Forwarder] Client disconnect timed out!")
+                except Exception as e:
+                    logger.error(f"[Telegram Forwarder] Error disconnecting client: {e}")
+            else:
+                # 保持连接，仅停止调度器
+                logger.info("[Telegram Forwarder] Keeping client connected for faster reload (cached in memory)")
 
         logger.info("[Telegram Forwarder] Plugin Stopped")
 
