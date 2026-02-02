@@ -64,6 +64,8 @@ class Forwarder:
         self._channel_locks = {}
         # 上次检查时间 (Key: ChannelName)
         self._channel_last_check = {}
+        # 全局发送锁，确保所有频道的消息按顺序发送，避免交错
+        self._global_send_lock = asyncio.Lock()
 
     def _get_channel_lock(self, channel_name):
         if channel_name not in self._channel_locks:
@@ -72,7 +74,21 @@ class Forwarder:
 
     async def check_updates(self):
         """
-        检查所有配置的频道更新
+        检查所有配置的频道更新 (FGSS 模式: Fetch-Gather-Sort-Send)
+
+        架构改进：
+        1. Fetch: 并发获取所有频道的新消息
+        2. Gather: 收集所有消息到全局队列
+        3. Sort: 按消息时间戳排序，确保跨频道时序正确
+        4. Send: 线性发送，避免交错混乱
+
+        优势：
+        - 保证严格的时间顺序（频道B的10:01消息不会在频道A的10:05消息之后）
+        - 避免Head-of-Line Blocking（通过超时控制慢速频道）
+
+        Trade-off:
+        - 稍微增加延迟（等待所有频道完成）
+        - 但换来更好的用户体验（消息按时间线排列）
         """
         # 检查连接状态
         if not self.client_wrapper.is_connected():
@@ -82,6 +98,12 @@ class Forwarder:
         channels_config = self.config.get("source_channels", [])
 
         async def process_one(cfg):
+            """
+            处理单个频道的配置，返回获取到的消息列表
+
+            Returns:
+                List[Tuple[str, Message]]: (channel_name, message) 元组列表
+            """
             try:
                 channel_name = ""
                 start_date = None
@@ -95,8 +117,8 @@ class Forwarder:
                     channel_name = cfg.get("channel_username", "")
                     if not channel_name:
                         logger.warning(f"Skipping channel config with missing 'channel_username': {cfg}")
-                        return
-                    
+                        return []
+
                     s_time = cfg.get("start_time", "")
                     if s_time:
                         try:
@@ -118,17 +140,17 @@ class Forwarder:
                                     start_date = datetime.strptime(p_parts[0], "%Y-%m-%d").replace(tzinfo=timezone.utc)
                                 except ValueError:
                                     logger.warning(f"Invalid date in preset {preset} for {channel_name}")
-                            
+
                             if len(p_parts) >= 2 and p_parts[1].isdigit():
                                 interval = int(p_parts[1])
-                            
+
                             if len(p_parts) >= 3 and p_parts[2].isdigit():
                                 msg_limit = int(p_parts[2])
-                                
+
                             logger.info(f"Applied preset {preset} for {channel_name}: date={start_date}, int={interval}, limit={msg_limit}")
                         except Exception as e:
                             logger.error(f"Error applying preset {preset} for {channel_name}: {e}")
-                
+
                 elif isinstance(cfg, str):
                     # Legacy string format: name|date|interval|limit
                     # 格式：channel_name | start_date | interval | limit
@@ -136,8 +158,8 @@ class Forwarder:
                     parts = [p.strip() for p in cfg.split("|")]
                     if not parts:
                         logger.warning(f"Skipping invalid channel string config: {cfg}")
-                        return
-                    
+                        return []
+
                     channel_name = parts[0]
                     ints_found = []
 
@@ -163,53 +185,98 @@ class Forwarder:
                         msg_limit = ints_found[1]
                 else:
                     logger.warning(f"Skipping unknown channel config type: {type(cfg)} - {cfg}")
-                    return  # Unknown type
+                    return []  # Unknown type
 
                 # Ensure channel_name is set
                 if not channel_name:
                     logger.warning(f"Channel name could not be determined for config: {cfg}")
-                    return
+                    return []
 
                 # 检查间隔
                 now = datetime.now().timestamp()
                 last_check = self._channel_last_check.get(channel_name, 0)
                 # 使用该频道配置的间隔判断
                 if now - last_check < interval:
-                    return # 还没到时间
+                    return [] # 还没到时间
 
                 # 获取该频道的锁
                 lock = self._get_channel_lock(channel_name)
 
                 # 如果锁被占用，跳过本次检查（非阻塞）
                 if lock.locked():
-                    return
+                    return []
 
                 async with lock:
                     self._channel_last_check[channel_name] = now
-                    # 处理该频道
-                    await self._process_channel(channel_name, start_date, msg_limit)
+                    # Fetch阶段：只获取消息，不发送
+                    messages = await self._fetch_channel_messages(channel_name, start_date, msg_limit)
+                    return [(channel_name, msg) for msg in messages]
 
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 # 记录错误但继续处理其他频道
                 logger.error(f"Error checking {cfg}: {e}")
+                return []
 
-        # 并行执行所有频道的检查任务
-        tasks = [process_one(cfg) for cfg in channels_config]
-        if tasks:
-            try:
-                await asyncio.gather(*tasks)
-            except asyncio.CancelledError:
-                pass  # 正常取消，忽略
-            except Exception as e:
-                logger.error(f"Error in check_updates gather: {e}")
+        # ========== Phase 1 & 2: Fetch & Gather ==========
+        # 并行获取所有频道的新消息，设置超时以避免 Head-of-Line Blocking
+        FETCH_TIMEOUT = 15  # 15秒超时，避免慢速频道拖累整体
 
-    async def _process_channel(
+        try:
+            # 并发执行所有频道的 Fetch 任务
+            tasks = [process_one(cfg) for cfg in channels_config]
+            if tasks:
+                # 使用 gather 并设置超时
+                all_channel_messages = await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=FETCH_TIMEOUT
+                )
+
+                # 合并所有频道的消息
+                global_message_queue = []
+                for channel_messages in all_channel_messages:
+                    if isinstance(channel_messages, Exception):
+                        logger.error(f"Channel fetch failed: {channel_messages}")
+                        continue
+                    if channel_messages:
+                        global_message_queue.extend(channel_messages)
+
+                # ========== Phase 3: Sort ==========
+                # 按消息时间戳排序，确保跨频道时序正确
+                if global_message_queue:
+                    # 按 message.date 排序（从旧到新）
+                    global_message_queue.sort(key=lambda x: x[1].date)
+
+                    logger.info(f"[FGSS] Sorted {len(global_message_queue)} messages from {len(channels_config)} channels by timestamp")
+
+                    # ========== Phase 4: Send ==========
+                    # 线性发送，严格按时间顺序
+                    await self._send_sorted_messages(global_message_queue)
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[FGSS] Fetch phase timeout after {FETCH_TIMEOUT}s, sending partial results")
+            # 发送已获取的消息
+            if 'global_message_queue' in locals() and global_message_queue:
+                global_message_queue.sort(key=lambda x: x[1].date)
+                await self._send_sorted_messages(global_message_queue)
+        except asyncio.CancelledError:
+            logger.info("[FGSS] Check updates cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"[FGSS] Error in check_updates: {e}")
+
+    async def _fetch_channel_messages(
         self, channel_name: str, start_date: Optional[datetime], msg_limit: int = 20
-    ):
+    ) -> List[Message]:
         """
-        处理单个频道的消息更新
+        Fetch阶段：从单个频道获取新消息（不发送）
+
+        Returns:
+            List[Message]: 获取到的新消息列表
+
+        Note:
+            此方法只负责获取消息，过滤和发送在后续阶段处理
         """
         # ========== 初始化频道状态 ==========
         if not self.storage.get_channel_data(channel_name).get("last_post_id"):
@@ -228,7 +295,7 @@ class Forwarder:
                     if msgs:
                         self.storage.update_last_id(channel_name, msgs[0].id)
                         logger.info(f"Initialized {channel_name} at ID {msgs[0].id}")
-                    return
+                    return []
 
             # ========== 获取新消息 ==========
             new_messages = []
@@ -246,116 +313,147 @@ class Forwarder:
                     continue
                 new_messages.append(message)
 
-            if not new_messages:
-                return
+            # 更新 last_post_id（无论消息是否会被过滤）
+            if new_messages:
+                max_id = max(m.id for m in new_messages)
+                self.storage.update_last_id(channel_name, max_id)
+                logger.info(f"[Fetch] {channel_name}: fetched {len(new_messages)} messages (max_id: {max_id})")
 
-            # ========== 处理过滤和分发 ==========
-            await self._process_messages_filter_and_dispatch(
-                channel_name, new_messages, last_id
-            )
+            return new_messages
 
         except Exception as e:
-            logger.error(f"Access error for {channel_name}: {e}")
+            logger.error(f"[Fetch] Error accessing {channel_name}: {e}")
+            return []
 
-    async def _process_messages_filter_and_dispatch(
-        self, channel_name: str, new_messages: list, last_id: int
-    ):
+    async def _send_sorted_messages(self, sorted_messages: List[tuple]):
         """
-        过滤消息并进行分发处理 (支持相册批处理)
+        Send阶段：发送已排序的消息（应用过滤和相册处理）
+
+        Args:
+            sorted_messages: 已按时间排序的 (channel_name, message) 元组列表
+
+        处理流程：
+        1. 过滤不想要的消息（关键词、正则、hashtag）
+        2. 识别相册（grouped_id）并分组
+        3. 按顺序发送每个批次
         """
         filter_keywords = self.config.get("filter_keywords", [])
         filter_regex = self.config.get("filter_regex", "")
         filter_hashtags = self.config.get("filter_hashtags", [])
 
-        # 收集所有需要发送的批次
-        all_batches = []
-
-        async def process_batch(batch):
-            if not batch:
-                return
-            batch_to_send = []
-            for msg in batch:
-                try:
-                    # ----- 反垃圾 / 频道过滤 -----
-                    is_user_msg = (
-                        isinstance(msg.from_id, PeerUser) if msg.from_id else False
-                    )
-                    if not msg.post and is_user_msg:
-                        continue
-
-                    text_content = msg.text or ""
-                    should_skip = False
-
-                    # Hashtag 过滤
-                    if filter_hashtags:
-                        for tag in filter_hashtags:
-                            if tag in text_content:
-                                logger.info(f"Filtered {msg.id}: Hashtag {tag}")
-                                should_skip = True
-                                break
-
-                    # Keyword 过滤
-                    if not should_skip and filter_keywords:
-                        for kw in filter_keywords:
-                            if kw in text_content:
-                                logger.info(f"Filtered {msg.id}: Keyword {kw}")
-                                should_skip = True
-                                break
-
-                    # Regex 过滤
-                    if not should_skip and filter_regex:
-                        if re.search(
-                            filter_regex, text_content, re.IGNORECASE | re.DOTALL
-                        ):
-                            logger.info(f"Filtered {msg.id}: Regex")
-                            should_skip = True
-
-                    if not should_skip:
-                        batch_to_send.append(msg)
-                except Exception as e:
-                    logger.error(f"Error filtering msg {msg.id}: {e}")
-
-            if batch_to_send:
-                all_batches.append(batch_to_send)
-
-            # 更新 last_id (无论是否发送/被过滤)
-            if batch:
-                max_id = max(m.id for m in batch)
-                self.storage.update_last_id(channel_name, max_id)
-
-        # 遍历消息进行批处理
-        pending_batch = []
-        for msg in new_messages:
+        # ========== Phase 1: 过滤消息 ==========
+        filtered_messages = []
+        for channel_name, msg in sorted_messages:
             try:
-                if msg.grouped_id:
-                    if pending_batch and pending_batch[0].grouped_id != msg.grouped_id:
-                        await process_batch(pending_batch)
-                        pending_batch = []
-                    pending_batch.append(msg)
-                else:
-                    if pending_batch:
-                        await process_batch(pending_batch)
-                        pending_batch = []
-                    await process_batch([msg])
+                # ----- 反垃圾 / 频道过滤 -----
+                is_user_msg = (
+                    isinstance(msg.from_id, PeerUser) if msg.from_id else False
+                )
+                if not msg.post and is_user_msg:
+                    continue
+
+                text_content = msg.text or ""
+                should_skip = False
+
+                # Hashtag 过滤
+                if filter_hashtags:
+                    for tag in filter_hashtags:
+                        if tag in text_content:
+                            logger.info(f"[Filter] {msg.id}: Hashtag '{tag}'")
+                            should_skip = True
+                            break
+
+                # Keyword 过滤
+                if not should_skip and filter_keywords:
+                    for kw in filter_keywords:
+                        if kw in text_content:
+                            logger.info(f"[Filter] {msg.id}: Keyword '{kw}'")
+                            should_skip = True
+                            break
+
+                # Regex 过滤
+                if not should_skip and filter_regex:
+                    if re.search(
+                        filter_regex, text_content, re.IGNORECASE | re.DOTALL
+                    ):
+                        logger.info(f"[Filter] {msg.id}: Regex match")
+                        should_skip = True
+
+                if not should_skip:
+                    filtered_messages.append((channel_name, msg))
             except Exception as e:
-                logger.error(f"Error in msg loop {msg.id}: {e}")
+                logger.error(f"[Filter] Error filtering msg {msg.id}: {e}")
 
-        if pending_batch:
-            await process_batch(pending_batch)
-            
-        # 批量分发 (Ensure atomicity)
-        if all_batches:
-             await self._dispatch_to_senders(channel_name, all_batches)
+        if not filtered_messages:
+            logger.info("[Send] All messages were filtered, nothing to send")
+            return
 
-    async def _dispatch_to_senders(self, src_channel: str, batches: List[List[Message]]):
-        """
-        将消息批次分发给所有 Sender
-        """
-        # 并行发送到各平台
-        await asyncio.gather(
-            self.tg_sender.send(batches, src_channel),
-            self.qq_sender.send(batches, src_channel),
-        )
+        logger.info(f"[Send] {len(filtered_messages)} messages after filtering (from {len(sorted_messages)} fetched)")
+
+        # ========== Phase 2: 相册分组 ==========
+        # 将消息按 grouped_id 分组，相册中的消息会作为整体发送
+        batches = []
+        current_batch = []
+
+        for channel_name, msg in filtered_messages:
+            if msg.grouped_id:
+                # 消息属于某个相册
+                if current_batch and current_batch[0][1].grouped_id == msg.grouped_id:
+                    # 同一个相册，添加到当前批次
+                    current_batch.append((channel_name, msg))
+                else:
+                    # 新的相册，保存当前批次并开始新批次
+                    if current_batch:
+                        batches.append(current_batch)
+                    current_batch = [(channel_name, msg)]
+            else:
+                # 普通消息
+                if current_batch:
+                    batches.append(current_batch)
+                    current_batch = []
+                batches.append([(channel_name, msg)])
+
+        if current_batch:
+            batches.append(current_batch)
+
+        logger.info(f"[Send] Organized into {len(batches)} batches (albums grouped)")
+
+        # ========== Phase 3: 线性发送 ==========
+        # 使用全局锁确保原子性，按顺序发送每个批次
+        async with self._global_send_lock:
+            for batch_idx, batch in enumerate(batches):
+                try:
+                    # 提取消息对象和源频道
+                    messages = [msg for _, msg in batch]
+                    src_channel = batch[0][0]  # 获取源频道名称
+
+                    # 判断批次类型（相册或单条消息）
+                    if len(messages) > 1:
+                        # 相册：所有消息的 grouped_id 相同
+                        batch_type = "album"
+                        grouped_id = messages[0].grouped_id
+                        logger.info(f"[Send] Batch {batch_idx + 1}/{len(batches)}: Album from {src_channel} (grouped_id={grouped_id}, {len(messages)} photos)")
+                    else:
+                        # 单条消息
+                        batch_type = "single"
+                        msg = messages[0]
+                        msg_preview = (msg.text[:30] + "...") if msg.text else f"[Media: {type(msg.media).__name__}]"
+                        logger.info(f"[Send] Batch {batch_idx + 1}/{len(batches)}: Single msg {msg.id} from {src_channel} ({msg_preview})")
+
+                    # 将批次转换为 Sender 期望的格式: List[List[Message]], src_channel
+                    sender_batches = [messages]
+
+                    # 并行发送到各平台
+                    await asyncio.gather(
+                        self.tg_sender.send(sender_batches, src_channel),
+                        self.qq_sender.send(sender_batches, src_channel),
+                    )
+
+                except Exception as e:
+                    logger.error(f"[Send] Error sending batch {batch_idx + 1}: {e}")
+                    # 继续发送下一个批次
+
+        logger.info(f"[Send] Completed sending {len(batches)} batches")
 
     def _cleanup_orphaned_files(self):
         """
