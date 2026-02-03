@@ -18,7 +18,6 @@ class PluginCommands:
 
         channels = self.config.get("source_channels", [])
         
-        # 检查是否已存在 (支持字典和字符串混合，以防万一)
         exists = False
         for c in channels:
             if isinstance(c, dict) and c.get("channel_username") == channel:
@@ -32,7 +31,6 @@ class PluginCommands:
             yield event.plain_result(f"⚠️ 频道 {channel} 已经在监控列表中。")
             return
 
-        # 使用 template_list 格式添加
         new_item = {
             "__template_key": "default",
             "channel_username": channel,
@@ -42,7 +40,7 @@ class PluginCommands:
         }
         channels.append(new_item)
         self.config["source_channels"] = channels
-        self.config.save_config()  # 保存配置
+        self.config.save_config()
         yield event.plain_result(f"✅ 已添加频道 {channel} 到监控列表。")
 
     async def remove_channel(self, event: AstrMessageEvent, channel: str):
@@ -82,19 +80,18 @@ class PluginCommands:
         for c in channels:
             if isinstance(c, dict):
                 name = c.get("channel_username", "Unknown")
-                s_time = c.get("start_time", "Realtime")
-                if not s_time: s_time = "Realtime"
+                s_time = c.get("start_time", "实时")
+                if not s_time: s_time = "实时"
                 display_list.append(f"- {name} ({s_time})")
             else:
                 display_list.append(f"- {c}")
 
-        msg = "📺当前监控的频道列表:\n" + "\n".join(display_list)
+        msg = "📺 当前监控的频道列表:\n" + "\n".join(display_list)
         yield event.plain_result(msg)
 
     async def force_check(self, event: AstrMessageEvent):
         """立即检查更新"""
         yield event.plain_result("🔄 正在触发立即检查更新...")
-        # 在后台立即执行 check_updates
         asyncio.create_task(self.forwarder.check_updates())
 
     async def show_help(self, event: AstrMessageEvent):

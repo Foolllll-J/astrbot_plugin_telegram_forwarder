@@ -13,16 +13,15 @@ class FileUploader:
 
     async def upload(self, fpath: str, hosting_url: str) -> Optional[str]:
         """
-        Upload a file to the hosting service, choosing strategy based on file size.
+        上传文件到托管服务
         """
         if not hosting_url:
             return None
 
         file_size = os.path.getsize(fpath)
-        # Use simple upload for < 20MB, chunked for larger
         if file_size > 20 * 1024 * 1024:
-            logger.info(
-                f"File > 20MB ({file_size} bytes), using Chunked Upload for {os.path.basename(fpath)}..."
+            logger.debug(
+                f"[Uploader] 文件大于 20MB ({file_size} 字节)，使用分块上传: {os.path.basename(fpath)}"
             )
             async with httpx.AsyncClient(proxy=self.proxy_url, timeout=300.0) as client:
                 return await self._upload_chunked(client, hosting_url, fpath)
@@ -31,7 +30,7 @@ class FileUploader:
 
     async def _upload_simple(self, hosting_url: str, fpath: str) -> Optional[str]:
         """
-        Standard multipart/form-data upload.
+        标准分段上传
         """
         async with httpx.AsyncClient(proxy=self.proxy_url, timeout=120.0) as client:
             filename = os.path.basename(fpath)
@@ -69,7 +68,6 @@ class FileUploader:
 
             params = {"uploadFolder": folder}
 
-            # Retry logic
             for attempt in range(3):
                 try:
                     with open(fpath, "rb") as f:
@@ -78,22 +76,22 @@ class FileUploader:
                             hosting_url, files=files, params=params
                         )
 
-                    if resp.status_code == 200:
-                        return self._extract_upload_url(resp.json(), hosting_url)
-                    else:
-                        logger.error(
-                            f"Upload failed (Attempt {attempt + 1}): {resp.status_code} {resp.text}"
-                        )
-                        if attempt == 2:
-                            break
-                        await asyncio.sleep(2)
+                        if resp.status_code == 200:
+                            return self._extract_upload_url(resp.json(), hosting_url)
+                        else:
+                            logger.error(
+                                f"[Uploader] 上传失败 (尝试 {attempt + 1}): {resp.status_code} {resp.text}"
+                            )
+                            if attempt == 2:
+                                break
+                            await asyncio.sleep(2)
                 except (
                     httpx.ConnectError,
                     httpx.RemoteProtocolError,
                     httpx.WriteError,
                     httpx.ReadTimeout,
                 ) as e:
-                    logger.warning(f"Upload network error (Attempt {attempt + 1}): {e}")
+                    logger.warning(f"[Uploader] 上传网络错误 (尝试 {attempt + 1}): {e}")
                     if attempt == 2:
                         break
                     await asyncio.sleep(2)
@@ -103,8 +101,7 @@ class FileUploader:
         self, uploader: httpx.AsyncClient, hosting_url: str, fpath: str
     ) -> Optional[str]:
         """
-        Chunked upload implementation.
-        Init -> Chunks -> Merge -> Poll
+        分块上传实现
         """
         try:
             chunk_size = 20 * 1024 * 1024  # 20MB
@@ -119,7 +116,7 @@ class FileUploader:
             elif ext == ".mp3":
                 original_filetype = "audio/mpeg"
 
-            # 1. Init
+            # 1. 初始化
             params = {"uploadFolder": "Telegram/Media", "initChunked": "true"}
             data = {
                 "totalChunks": str(total_chunks),
@@ -132,7 +129,7 @@ class FileUploader:
                 hosting_url, params=params, data=data, files=dummy_files, timeout=30
             )
             if resp.status_code != 200:
-                logger.error(f"Chunked Init failed: {resp.status_code} {resp.text}")
+                logger.error(f"[Uploader] 分块上传初始化失败: {resp.status_code} {resp.text}")
                 return None
 
             resp_data = resp.json()
@@ -142,7 +139,7 @@ class FileUploader:
             if not upload_id:
                 return None
 
-            # 2. Upload Chunks
+            # 2. 上传分块
             with open(fpath, "rb") as f:
                 for i in range(total_chunks):
                     chunk_data = f.read(chunk_size)
@@ -172,9 +169,9 @@ class FileUploader:
                         except Exception:
                             await asyncio.sleep(2)
                     else:
-                        return None  # Failed after retries
+                        return None
 
-            # 3. Merge
+            # 3. 合并
             m_params = {
                 "uploadFolder": "Telegram/Media",
                 "chunked": "true",
@@ -186,9 +183,6 @@ class FileUploader:
                 "originalFileName": original_filename,
                 "originalFileType": original_filetype,
             }
-            # Note: files=... is needed to force multipart format if data doesn't trigger it,
-            # though usually data with file-like objects does. Here we used dummy in original code.
-            # We'll use the same dummy trick to be safe.
             m_resp = await uploader.post(
                 hosting_url,
                 params=m_params,
@@ -201,7 +195,7 @@ class FileUploader:
             if m_resp.status_code == 200:
                 final_resp = m_resp.json()
             elif m_resp.status_code == 202:
-                # Async polling
+                # 轮询状态
                 check_url = m_resp.json().get("statusCheckUrl")
                 if not check_url:
                     check_url = f"/upload?uploadId={upload_id}&statusCheck=true&chunked=true&merge=true"
@@ -243,11 +237,11 @@ class FileUploader:
             return None
 
         except Exception as e:
-            logger.error(f"Chunked Upload Exception: {e}")
+            logger.error(f"[Uploader] 分块上传异常: {e}")
             return None
 
     def _extract_upload_url(self, res_json: dict, base_url: str) -> str:
-        """Extract URL from response"""
+        """从响应中提取 URL"""
         parsed = urlparse(base_url)
         root_url = f"{parsed.scheme}://{parsed.netloc}"
 

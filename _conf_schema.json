@@ -117,10 +117,28 @@
         "hint": "每隔多少秒检查一次新消息",
         "default": 60
     },
-    "forward_delay": {
+    "send_interval": {
         "type": "int",
-        "default": 2,
-        "description": "防刷屏/免打扰延迟 (秒)"
+        "default": 60,
+        "description": "发送执行间隔 (秒)",
+        "hint": "从待发送队列中提取消息并执行转发的周期"
+    },
+    "batch_size_limit": {
+        "description": "单次发送消息批次上限",
+        "hint": "每批次发送时单次消息数量上限",
+        "type": "int",
+        "slider": {
+            "min": 1,
+            "max": 20,
+            "step": 1
+        },
+        "default": 3
+    },
+    "retention_period": {
+        "description": "消息保留时间 (秒)",
+        "hint": "如果超过这个时间的之前捕获到的消息将在发送前先被删除",
+        "type": "int",
+        "default": 86400
     },
     "filter_keywords": {
         "type": "list",
@@ -138,8 +156,8 @@
     "proxy": {
         "description": "代理地址",
         "type": "string",
-        "hint": "访问 Telegram 需要代理，例如 http://127.0.0.1:7897",
-        "default": "http://127.0.0.1:7897"
+        "hint": "访问 Telegram 需要代理，例如 http://127.0.0.1:7890",
+        "default": ""
     },
     "file_hosting_url": {
         "description": "图床上传接口",
