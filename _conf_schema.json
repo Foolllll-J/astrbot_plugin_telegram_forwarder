@@ -1,26 +1,34 @@
 {
-    "enabled": {
-        "description": "是否启用插件",
-        "type": "bool",
-        "default": true
+    "napcat_api_url": {
+        "description": "NapCat API 地址",
+        "type": "string",
+        "hint": "NapCat 的 HTTP API 地址。若设为 localhost，则使用 AstrBot 内部接口发送（推荐）。",
+        "default": "localhost"
     },
-    "enable_forward_to_qq": {
-        "description": "开启 QQ 转发",
-        "type": "bool",
-        "default": true,
-        "hint": "是否将消息转发到 QQ 群"
+    "target_qq_group": {
+        "description": "QQ 目标群号",
+        "type": "list",
+        "item_type": "int",
+        "hint": "转发到 QQ 群列表",
+        "default": []
     },
-    "enable_forward_to_tg": {
-        "description": "开启 TG 转发",
-        "type": "bool",
-        "default": false,
-        "hint": "是否将消息转发到目标 Telegram 频道"
+    "bot_token": {
+        "description": "TG Bot Token",
+        "type": "string",
+        "hint": "转发到 Telegram 目标频道时需要，从 @BotFather 获取",
+        "default": ""
     },
-    "exclude_text_on_media": {
-        "description": "媒体消息仅发送媒体",
-        "type": "bool",
-        "default": false,
-        "hint": "如果消息包含媒体（图片、音频等），则不发送文本内容（包含标题和 From 头部）"
+    "target_channel": {
+        "description": "TG 目标频道 ID",
+        "type": "string",
+        "hint": "接收消息的频道，例如 @my_channel_name 或 -100xxxxxxx",
+        "default": ""
+    },
+    "phone": {
+        "description": "手机号",
+        "type": "string",
+        "default": "",
+        "hint": "登录用的手机号（国际格式，如 +86138...），首次运行时需要"
     },
     "api_id": {
         "description": "App API ID",
@@ -38,14 +46,10 @@
         "type": "file",
         "description": "Telegram Session 文件",
         "default": [],
-        "file_types": ["session"],
-        "hint": "上传 .session 文件以直接登录，避免验证码问题。你可以使用本地脚本生成此文件后上传。"
-    },
-    "phone": {
-        "description": "手机号",
-        "type": "string",
-        "default": "",
-        "hint": "登录用的手机号（国际格式，如 +86138...），首次运行时需要。"
+        "file_types": [
+            "session"
+        ],
+        "hint": "上传 .session 文件以直接登录，避免验证码问题，你可以使用本地脚本生成此文件后上传"
     },
     "source_channels": {
         "description": "源频道配置列表",
@@ -101,53 +105,22 @@
         "hint": "添加并配置需要转发的 Telegram 频道",
         "obvious_hint": true
     },
+    "exclude_text_on_media": {
+        "description": "媒体消息仅发送媒体",
+        "type": "bool",
+        "default": false,
+        "hint": "如果消息包含媒体（图片、音频等），则不发送文本内容（包含标题和 From 头部）"
+    },
     "check_interval": {
         "description": "检测间隔(秒)",
         "type": "int",
         "hint": "每隔多少秒检查一次新消息",
         "default": 60
     },
-    "proxy": {
-        "description": "代理地址",
-        "type": "string",
-        "hint": "访问 Telegram 需要代理，例如 http://127.0.0.1:7897",
-        "default": "http://127.0.0.1:7897"
-    },
-    "bot_token": {
-        "description": "TG Bot Token",
-        "type": "string",
-        "hint": "转发到 Telegram 目标频道时需要，从 @BotFather 获取",
-        "default": ""
-    },
-    "target_channel": {
-        "description": "TG 目标频道 ID",
-        "type": "string",
-        "hint": "接收消息的频道，例如 @my_channel_name 或 -100xxxxxxx",
-        "default": ""
-    },
-    "target_qq_group": {
-        "description": "QQ 目标群号",
-        "type": "list",
-        "item_type": "int",
-        "hint": "转发到 QQ 群列表",
-        "default": []
-    },
     "forward_delay": {
         "type": "int",
         "default": 2,
         "description": "防刷屏/免打扰延迟 (秒)"
-    },
-    "file_hosting_url": {
-        "description": "图床上传接口",
-        "type": "string",
-        "hint": "用于上传视频/大文件的图床接口 (如 Cloudflare Pages)",
-        "default": ""
-    },
-    "napcat_api_url": {
-        "description": "NapCat API 地址",
-        "type": "string",
-        "hint": "NapCat 的 HTTP API 地址。若设为 localhost，则使用 AstrBot 内部接口发送（推荐）。",
-        "default": "localhost"
     },
     "filter_keywords": {
         "type": "list",
@@ -161,6 +134,18 @@
         "description": "正则过滤",
         "default": "",
         "hint": "Python 正则表达式过滤。留空则不启用。"
+    },
+    "proxy": {
+        "description": "代理地址",
+        "type": "string",
+        "hint": "访问 Telegram 需要代理，例如 http://127.0.0.1:7897",
+        "default": "http://127.0.0.1:7897"
+    },
+    "file_hosting_url": {
+        "description": "图床上传接口",
+        "type": "string",
+        "hint": "用于上传视频/大文件的图床接口 (如 Cloudflare Pages)",
+        "default": ""
     },
     "merge_rules": {
         "type": "template_list",

@@ -171,28 +171,26 @@ class Main(star.Star):
         # 检查客户端是否成功连接并授权
         if self.client_wrapper.is_authorized():
             # ========== 启动定时调度器 ==========
-            # 仅当插件配置为启用状态时才启动
-            if self.config.get("enabled", True):
-                # 从配置获取检查间隔，默认 60 秒
-                interval = self.config.get("check_interval", 60)
+            # 从配置获取检查间隔，默认 60 秒
+            interval = self.config.get("check_interval", 60)
 
-                # 添加定时任务：每隔 interval 秒执行一次 check_updates
-                # max_instances=10: 允许最多10个并发任务，确保"快"的频道能绕过"慢"的频道
-                self.scheduler.add_job(
-                    self.forwarder.check_updates,
-                    "interval",
-                    seconds=interval,
-                    max_instances=10,
-                    coalesce=False,
-                )
+            # 添加定时任务：每隔 interval 秒执行一次 check_updates
+            # max_instances=10: 允许最多10个并发任务，确保"快"的频道能绕过"慢"的频道
+            self.scheduler.add_job(
+                self.forwarder.check_updates,
+                "interval",
+                seconds=interval,
+                max_instances=10,
+                coalesce=False,
+            )
 
-                # 启动调度器
-                self.scheduler.start()
+            # 启动调度器
+            self.scheduler.start()
 
-                # 记录正在监控的频道列表
-                logger.info(
-                    f"Monitoring channels: {self.config.get('source_channels')}"
-                )
+            # 记录正在监控的频道列表
+            logger.info(
+                f"Monitoring channels: {self.config.get('source_channels')}"
+            )
 
         # 捕获 QQ 平台实例变量初始化
         self.bot = None

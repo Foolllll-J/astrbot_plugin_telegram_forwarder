@@ -22,13 +22,12 @@ class TelegramSender:
         """
         tg_target = self.config.get("target_channel")
         bot_token = self.config.get("bot_token")
-        enable_tg = self.config.get("enable_forward_to_tg", False)
 
         if not batches:
             return
 
-        # 只有配置了目标频道和 bot_token 且启用开关时才转发
-        if tg_target and bot_token and enable_tg:
+        # 只要配置了目标频道和 bot_token，就认为启用 TG 转发
+        if tg_target and bot_token:
             try:
                 # ========== 解析目标频道 ==========
                 target = tg_target

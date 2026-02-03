@@ -42,13 +42,10 @@ class QQSender:
         """
         qq_groups = self.config.get("target_qq_group")
         napcat_url = self.config.get("napcat_api_url")
-        enable_qq = self.config.get("enable_forward_to_qq", True)
         exclude_text_on_media = self.config.get("exclude_text_on_media", False)
 
-        if not enable_qq:
-            return
-
-        if not (qq_groups and napcat_url) or not batches:
+        # 检查是否配置了 QQ 群，如果没有配置则认为不启用 QQ 转发
+        if not qq_groups or not napcat_url or not batches:
             return
 
         if isinstance(qq_groups, int):
