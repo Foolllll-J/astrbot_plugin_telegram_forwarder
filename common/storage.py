@@ -1,19 +1,3 @@
-"""
-数据持久化存储模块
-
-提供 JSON 格式的数据持久化功能，用于保存每个频道的最后处理消息ID。
-这样在插件重启后可以从上次的位置继续处理，避免重复转发消息。
-
-数据结构：
-{
-    "channels": {
-        "channel_name": {
-            "last_post_id": 12345
-        }
-    }
-}
-"""
-
 import json
 import os
 from astrbot.api import logger
@@ -41,72 +25,73 @@ class Storage:
         self.persistence = self._load()
 
     def _load(self) -> dict:
-        """
-        从文件加载持久化数据
-
-        Returns:
-            dict: 加载的数据字典，如果失败则返回默认空结构
-
-        异常处理：
-            - 文件不存在：返回默认数据
-            - JSON 解析错误：记录警告并返回默认数据
-            - IO 错误：记录警告并返回默认数据
-
-        默认结构：
-            {"channels": {}}
-        """
+        """从文件加载持久化数据"""
         default_data = {"channels": {}}
 
-        # 检查文件是否存在
         if os.path.exists(self.data_file):
             try:
-                # 尝试读取并解析 JSON 文件
                 with open(self.data_file, "r", encoding="utf-8") as f:
                     return json.load(f)
             except (json.JSONDecodeError, IOError) as e:
-                # 捕获特定异常类型，避免隐藏其他错误
-                logger.warning(f"Failed to load data file: {e}, using defaults")
+                logger.warning(f"[Storage] 无法加载数据文件: {e}，将使用默认配置")
                 return default_data
 
-        # 文件不存在时返回默认数据
         return default_data
 
     def save(self):
-        """
-        保存当前数据到文件
-
-        异常处理：
-            - 捕获 IO 错误并记录日志，避免程序崩溃
-
-        Note:
-            每次更新频道状态后都应调用此方法确保持久化
-        """
+        """保存当前数据到文件"""
         try:
-            # 使用缩进格式化 JSON，方便人类阅读和调试
             with open(self.data_file, "w", encoding="utf-8") as f:
                 json.dump(self.persistence, f, indent=2)
         except IOError as e:
-            # 保存失败时记录错误日志，但不中断程序
-            logger.error(f"Failed to save data: {e}")
+            logger.error(f"[Storage] 保存数据失败: {e}")
 
     def get_channel_data(self, channel_name: str) -> dict:
-        """
-        获取频道的持久化数据
-
-        Args:
-            channel_name: 频道名称或ID
-
-        Returns:
-            dict: 包含该频道数据的字典，至少包含 {"last_post_id": 0}
-
-        行为：
-            - 如果频道不存在，自动创建并初始化
-            - 返回的是字典引用，修改会直接影响内存中的数据
-        """
-        # 如果频道不存在于存储中，初始化为空状态
+        """获取频道的持久化数据"""
         if channel_name not in self.persistence["channels"]:
-            self.persistence["channels"][channel_name] = {"last_post_id": 0}
+            self.persistence["channels"][channel_name] = {
+                "last_post_id": 0,
+                "pending_queue": []
+            }
+        
+        if "pending_queue" not in self.persistence["channels"][channel_name]:
+            self.persistence["channels"][channel_name]["pending_queue"] = []
+            
         return self.persistence["channels"][channel_name]
+
+    def add_to_pending_queue(self, channel_name: str, msg_id: int, timestamp: float, grouped_id: int = None):
+        """添加单条消息到待发送队列"""
+        data = self.get_channel_data(channel_name)
+        if not any(m["id"] == msg_id for m in data["pending_queue"]):
+            data["pending_queue"].append({
+                "id": msg_id, 
+                "time": timestamp,
+                "grouped_id": grouped_id
+            })
+            self.save()
+            logger.debug(f"[Storage] 消息 {msg_id} (组: {grouped_id}) 已保存到 {channel_name} 待发送队列")
+
+    def update_pending_queue(self, channel_name: str, queue: list):
+        """更新频道的待发送队列"""
+        data = self.get_channel_data(channel_name)
+        old_len = len(data["pending_queue"])
+        data["pending_queue"] = queue
+        self.save()
+        if old_len != len(queue):
+            logger.debug(f"[Storage] 更新 {channel_name} 队列长度: {old_len} -> {len(queue)}")
+
+    def get_all_pending(self) -> list:
+        """获取所有频道的所有待发送消息"""
+        all_pending = []
+        for channel_name, info in self.persistence.get("channels", {}).items():
+            for msg in info.get("pending_queue", []):
+                all_pending.append({
+                    "channel": channel_name,
+                    "id": msg["id"],
+                    "time": msg["time"],
+                    "grouped_id": msg.get("grouped_id")
+                })
+        return all_pending
 
     def update_last_id(self, channel_name: str, last_id: int):
         """

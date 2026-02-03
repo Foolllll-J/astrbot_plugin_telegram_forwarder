@@ -1,12 +1,3 @@
-"""
-Telegram 客户端封装模块
-
-提供 Telegram 客户端的初始化、连接、认证等功能。
-支持代理配置、会话管理、自动重连等特性。
-
-使用 Telethon 库：https://docs.telethon.dev/
-"""
-
 from telethon import TelegramClient
 import sys
 import socks
@@ -87,14 +78,12 @@ class TelegramClientWrapper:
             # 尝试从缓存中获取已连接的客户端
             if session_path in cache:
                 cached_client = cache[session_path]
-                # 检查缓存的客户端是否仍然有效
                 if cached_client and cached_client.is_connected():
-                    logger.info("[Client Cache] Reusing existing Telegram client connection")
+                    logger.debug(f"[Client Cache] 复用现有的 Telegram 客户端连接: {session_path}")
                     self.client = cached_client
                     return
                 else:
-                    # 缓存的客户端已断开，移除
-                    logger.info("[Client Cache] Cached client disconnected, creating new one")
+                    logger.debug(f"[Client Cache] 缓存的客户端已断开，正在重新创建: {session_path}")
                     del cache[session_path]
 
             # ========== 代理配置解析 ==========
@@ -103,24 +92,16 @@ class TelegramClientWrapper:
 
             if proxy_url:
                 try:
-                    # 使用 urlparse 进行健壮的 URL 解析
                     parsed = urlparse(proxy_url)
-
-                    # 根据协议确定代理类型
                     proxy_type = (
                         socks.HTTP if parsed.scheme.startswith("http") else socks.SOCKS5
                     )
-
-                    # 构建 Telethon 代理元组：(类型, 主机, 端口)
                     proxy_setting = (proxy_type, parsed.hostname, parsed.port)
-
-                    logger.info(f"Using proxy: {proxy_setting}")
+                    logger.debug(f"[Client] 使用代理: {proxy_url}")
                 except (ValueError, AttributeError) as e:
-                    # 捕获解析错误，避免程序崩溃
-                    logger.error(f"Invalid proxy URL: {e}")
+                    logger.error(f"[Client] 代理 URL 格式错误: {e}")
 
             # ========== 创建 Telegram 客户端 ==========
-            # connection_retries=None 表示无限重连
             self.client = TelegramClient(
                 session_path,
                 api_id,
@@ -129,20 +110,15 @@ class TelegramClientWrapper:
                 connection_retries=None,
                 retry_delay=5,
                 auto_reconnect=True,
-                # Optimization: Hardcode DC IPs to avoid DNS issues and potentially improve speed
-                # DC 1: Miami, DC 2: Amsterdam, DC 3: Miami, DC 4: Amsterdam, DC 5: Singapore
-                # system_version="4.16.30-vxCustom"
             )
 
             # ========== 加入缓存 ==========
             cache[session_path] = self.client
-            logger.info("[Client Cache] Created and cached new Telegram client")
-            # self.client.session.set_dc(2, '149.154.167.50', 443)
+            logger.debug(f"[Client Cache] 已创建并缓存新的 Telegram 客户端: {session_path}")
 
         else:
-            # 配置不完整时输出警告
             logger.warning(
-                "Telegram Forwarder: api_id/api_hash missing. Please configure them."
+                "Telegram Forwarder: 缺少 api_id 或 api_hash，请在配置中填写。"
             )
 
     async def start(self):
@@ -177,137 +153,82 @@ class TelegramClientWrapper:
                 session_path = os.path.join(self.plugin_data_dir, "user_session")
                 auth_cache = get_auth_cache()
 
-                # 检查全局授权状态缓存
                 if auth_cache.get(session_path, False):
-                    # 已授权，跳过初始化
                     self._authorized = True
-                    logger.info("[Client Cache] Reusing authorized client (from cache), skipping initialization")
+                    logger.debug(f"[Client Cache] 复用已授权的客户端: {session_path}")
                     return
                 else:
-                    # 首次检查授权状态
                     authorized = await self.client.is_user_authorized()
                     if authorized:
-                        # 更新全局缓存
                         auth_cache[session_path] = True
                         self._authorized = True
-                        logger.info("[Client Cache] Reusing authorized client, skipping initialization")
+                        logger.debug(f"[Client Cache] 复用已授权的客户端: {session_path}")
                         return
-                    else:
-                        # 未授权，继续执行初始化流程
-                        pass
-            else:
-                # 未连接，继续执行初始化流程
-                pass
 
             # ========== 慢速路径：完整初始化 ==========
-            # ========== 连接服务器 ==========
             await self.client.connect()
 
             # ========== 检查授权状态 ==========
             authorized = await self.client.is_user_authorized()
             if not authorized:
-                logger.warning(f"Telegram Forwarder: Client NOT authorized. Session path: {os.path.join(self.plugin_data_dir, 'user_session.session')}")
+                logger.warning(f"[Client] 客户端未授权。会话路径: {os.path.join(self.plugin_data_dir, 'user_session.session')}")
 
-                # 检查 session 文件是否存在且大小不为 0
-                s_path = os.path.join(self.plugin_data_dir, 'user_session.session')
-                if os.path.exists(s_path):
-                    logger.info(f"Session file exists, size: {os.path.getsize(s_path)} bytes")
-                else:
-                    logger.error(f"Session file NOT FOUND at {s_path}")
-
-                # 尝试使用电话号码登录
                 phone = self.config.get("phone")
                 if phone:
-                    logger.info(f"Attempting to login with phone {phone}...")
-
+                    logger.info(f"[Client] 正在尝试使用手机号 {phone} 登录...")
                     try:
-                        # 发送验证码请求，设置30秒超时
                         await asyncio.wait_for(
                             self.client.send_code_request(phone), timeout=30.0
                         )
                     except asyncio.TimeoutError:
-                        logger.error("Send code request timed out")
+                        logger.error("[Client] 发送验证码请求超时")
                         return
 
-                    try:
-                        # 非阻塞式错误提示
-                        # 在插件加载环境中无法交互式输入验证码
-                        logger.error(
-                            f"Telegram Client needs authentication! Please authenticate via CLI or providing session file."
-                        )
-                        logger.error(
-                            f"Cannot prompt for code in this environment. Please run the script in interactive mode to login once."
-                        )
-                        return
-                    except Exception as e:
-                        logger.error(f"Login failed: {e}")
-                        return
+                    logger.error("[Client] Telegram 客户端需要验证！请在交互式终端运行一次以完成登录。")
+                    return
                 else:
-                    # 没有提供电话号码
-                    logger.error("No phone number provided in config. Cannot login.")
+                    logger.error("[Client] 未提供手机号，无法登录。")
                     return
 
             # ========== 授权成功 ==========
-            logger.info("Telegram Forwarder: Client authorized successfully!")
+            logger.info("[Client] Telegram 客户端授权成功！")
             self._authorized = True
 
-            # 更新全局授权缓存
             session_path = os.path.join(self.plugin_data_dir, "user_session")
             auth_cache = get_auth_cache()
             auth_cache[session_path] = True
 
             # ========== 同步对话框 ==========
-            # 获取所有对话框，确保能正确解析频道ID和用户名
-            # 只在首次连接时同步，避免每次重载都执行
-            logger.info("Syncing dialogs...")
+            logger.debug("[Client] 正在同步对话框...")
             await self.client.get_dialogs(limit=None)
-            logger.info("Telegram Forwarder: Dialog sync complete")
+            logger.debug("[Client] 对话框同步完成")
 
         except Exception as e:
-            # 捕获所有异常并记录日志
-            logger.error(f"Telegram Client Error: {e}")
+            logger.error(f"[Client] Telegram 客户端错误: {e}")
             self._authorized = False
 
     def is_connected(self):
-        """
-        检查客户端连接状态
-
-        Returns:
-            bool: 如果客户端存在且已连接返回 True，否则返回 False
-        """
+        """检查客户端连接状态"""
         return self.client and self.client.is_connected()
 
     def is_authorized(self):
-        """
-        检查客户端是否已授权
-        """
+        """检查客户端是否已授权"""
         return getattr(self, "_authorized", False) and self.is_connected()
 
     @staticmethod
     def clear_cache(session_path=None):
-        """
-        清理客户端缓存和授权状态缓存
-
-        Args:
-            session_path: 可选，指定要清理的会话路径。
-                        如果为 None，则清理所有缓存的客户端。
-
-        当配置发生重大变化（如 api_id/api_hash 更改）时，
-        应该调用此方法清除旧的客户端连接。
-        """
+        """清理客户端缓存和授权状态缓存"""
         cache = get_client_cache()
         auth_cache = get_auth_cache()
 
         if session_path:
-            # 清理指定会话的缓存
             if session_path in cache:
-                logger.info(f"[Client Cache] Clearing cache for session: {session_path}")
+                logger.debug(f"[Client Cache] 清理会话缓存: {session_path}")
                 del cache[session_path]
             if session_path in auth_cache:
                 del auth_cache[session_path]
         else:
-            # 清理所有缓存
             client_count = len(cache)
-            logger.info(f"[Client Cache] Clearing all cached clients ({client_count} sessions)")
+            logger.debug(f"[Client Cache] 清理所有缓存 ({client_count} 个会话)")
             cache.clear()
             auth_cache.clear()

@@ -1,20 +1,8 @@
-"""
-Telegram 消息转发插件 - 主入口
-
-本插件用于从 Telegram 频道自动转发消息到其他 Telegram 频道或 QQ 群。
-支持消息过滤、媒体文件处理、冷启动等功能。
-
-主要组件：
-- Storage: 持久化存储每个频道的最后一条消息ID
-- TelegramClientWrapper: Telegram 客户端封装
-- Forwarder: 消息转发核心逻辑
-- AsyncIOScheduler: 定时任务调度器
-"""
-
 import asyncio
 import os
 import shutil
 import filecmp
+from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from astrbot.api import logger, star, AstrBotConfig
@@ -37,20 +25,12 @@ class Main(star.Star):
     def __init__(self, context: star.Context, config: AstrBotConfig) -> None:
         """
         插件初始化
-
-        Args:
-            context: AstrBot 上下文对象，提供框架级别的API访问
-            config: 插件配置对象
-
-        初始化流程：
-        1. 设置数据持久化目录
-        2. 初始化存储、客户端、转发器组件
-        3. 创建定时任务调度器
-        4. 启动 Telegram 客户端（如果配置完整）
         """
         super().__init__(context)
         self.context = context
         self.config = config
+        self.bot = None # 初始化 bot 属性，防止 on_qq_message 报错
+
 
         # ========== 设置数据目录 ==========
         self.plugin_data_dir = str(StarTools.get_data_dir())
@@ -83,19 +63,12 @@ class Main(star.Star):
                 if should_migrate:
                     try:
                         shutil.copy2(src, dst)
-                        logger.warning(
-                            f"[Migration] Moved {filename} from plugin dir to data dir."
-                        )
-
-                        # 可选：迁移后重命名源文件作为备份，防止下次误判 (或者保留作为备份)
-                        # os.rename(src, src + ".bak")
+                        logger.debug(f"[Migration] 已将 {filename} 从插件目录迁移到数据目录。")
                     except Exception as e:
-                        logger.error(f"[Migration] Failed to move {filename}: {e}")
+                        logger.error(f"[Migration] 迁移 {filename} 失败: {e}")
 
         # ========== 初始化核心组件 ==========
-        # Storage: 负责持久化存储频道消息ID
         self.storage = Storage(os.path.join(self.plugin_data_dir, "data.json"))
-
 
         # ========== 处理上传的 Session 文件 ==========
         session_files = self.config.get("telegram_session", [])
@@ -111,47 +84,44 @@ class Main(star.Star):
                     try:
                         if filecmp.cmp(full_uploaded_path, target_session_path, shallow=False):
                             should_copy = False
-                            logger.info("Telegram Forwarder: Session file unchanged, skipping sync to avoid file lock.")
+                            logger.debug("[Main] 会话文件未变化，跳过同步。")
                     except Exception as e:
-                        logger.warning(f"Failed to compare session files: {e}")
+                        logger.warning(f"[Main] 比较会话文件失败: {e}")
 
                 if should_copy:
                     try:
                         shutil.copy2(full_uploaded_path, target_session_path)
-                        logger.info(f"Telegram Forwarder: 已从上传配置同步会话文件: {target_session_path} (源: {full_uploaded_path})")
+                        logger.debug(f"[Main] 已从上传配置同步会话文件: {target_session_path}")
                         
-                        # Clear cache if we updated the file
                         from .core.client import get_client_cache
                         cache = get_client_cache()
                         if target_session_path in cache:
-                            logger.warning("Session file updated. Clearing cache to force reconnection.")
+                            logger.debug("[Main] 会话文件已更新，清理缓存以强制重新连接。")
                             del cache[target_session_path]
                             
                     except Exception as e:
-                        logger.error(f"Telegram Forwarder: 同步会话文件失败 (可能被占用): {e}")
+                        logger.error(f"[Main] 同步会话文件失败 (可能被占用): {e}")
             else:
-                logger.warning(f"Telegram Forwarder: 配置中的会话文件路径不存在: {full_uploaded_path}")
+                logger.warning(f"[Main] 配置中的会话文件路径不存在: {full_uploaded_path}")
 
         # TelegramClientWrapper: 封装 Telegram 客户端连接逻辑
         self.client_wrapper = TelegramClientWrapper(self.config, self.plugin_data_dir)
 
-        # Forwarder: 消息转发核心逻辑，处理消息过滤、媒体下载、多平台发送
+        # Forwarder: 消息转发核心逻辑
         self.forwarder = Forwarder(
             self.context, self.config, self.storage, self.client_wrapper, self.plugin_data_dir
         )
 
         # ========== 初始化定时任务调度器 ==========
-        # 使用 APScheduler 的异步调度器，定期检查 Telegram 频道更新
         self.scheduler = AsyncIOScheduler()
 
         # 初始化命令处理器
         self.command_handler = PluginCommands(context, config, self.forwarder)
 
         # ========== 配置检查警告 ==========
-        # 如果缺少必要的配置，输出警告日志提醒用户
         if not self.config.get("api_id") or not self.config.get("api_hash"):
             logger.warning(
-                "Telegram Forwarder: api_id/api_hash missing. Please configure them."
+                "Telegram Forwarder: 缺少 api_id 或 api_hash，请在配置中填写。"
             )
 
     async def initialize(self):
@@ -171,29 +141,25 @@ class Main(star.Star):
         # 检查客户端是否成功连接并授权
         if self.client_wrapper.is_authorized():
             # ========== 启动定时调度器 ==========
-            # 从配置获取检查间隔，默认 60 秒
-            interval = self.config.get("check_interval", 60)
-
-            # 添加定时任务：每隔 interval 秒执行一次 check_updates
-            # max_instances=10: 允许最多10个并发任务，确保"快"的频道能绕过"慢"的频道
+            # 目前采用一体化 FGSS 模式，只需一个任务即可
+            send_interval = self.config.get("check_interval", 60) # 使用全局检查间隔
             self.scheduler.add_job(
                 self.forwarder.check_updates,
                 "interval",
-                seconds=interval,
-                max_instances=10,
-                coalesce=False,
+                seconds=send_interval,
+                max_instances=1,
+                coalesce=True,
+                next_run_time=datetime.now() + timedelta(seconds=60) # 首次执行稍作延迟
             )
 
             # 启动调度器
             self.scheduler.start()
 
-            # 记录正在监控的频道列表
-            logger.info(
-                f"Monitoring channels: {self.config.get('source_channels')}"
-            )
+            logger.info(f"Telegram Forwarder 已启动。检查间隔: {send_interval}s")
+            logger.debug(f"正在监控频道: {self.config.get('source_channels')}")
 
-        # 捕获 QQ 平台实例变量初始化
-        self.bot = None
+        # 捕获 QQ 平台实例变量初始化 (已在 __init__ 中处理)
+        # self.bot = None
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP | filter.PlatformAdapterType.QQOFFICIAL)
     async def on_qq_message(self, event: AstrMessageEvent):
@@ -201,55 +167,47 @@ class Main(star.Star):
         umo = event.unified_msg_origin
         if ":" in umo:
             platform_id = umo.split(":")[0]
-            # 如果尚未获取到 bot，或者 platform_id 发生了变化
             if not self.bot or getattr(self.forwarder.qq_sender, "platform_id", None) != platform_id:
                 self.bot = event.bot
                 if hasattr(self, "forwarder") and hasattr(self.forwarder, "qq_sender"):
                     self.forwarder.qq_sender.platform_id = platform_id
-                logger.info(f"通过消息事件成功捕获/更新 QQ platform_id: {platform_id}")
+                    self.forwarder.qq_sender.bot = event.bot
+                logger.debug(f"通过消息事件成功捕获/更新 QQ platform_id: {platform_id}")
+                
+                if hasattr(self.forwarder.qq_sender, "_ensure_node_name"):
+                    asyncio.create_task(self.forwarder.qq_sender._ensure_node_name(event.bot))
 
     async def terminate(self):
-        """
-        插件终止时的清理工作
-
-        优化策略：
-        1. 保持客户端连接在全局缓存中，避免插件重载时重新连接
-        2. 只有在完全停止时才断开连接（通过配置参数控制）
-        3. 配置保存时只需停止调度器，客户端保持连接状态
-        """
-        logger.info("[Telegram Forwarder] Terminating plugin...")
+        """插件终止时的清理工作"""
+        logger.debug("[Main] 正在停止插件...")
 
         # 1. Stop Scheduler
         if self.scheduler.running:
-            logger.info("[Telegram Forwarder] Shutting down scheduler...")
+            logger.debug("[Main] 正在关闭调度器...")
             self.scheduler.shutdown(wait=False)
-            logger.info("[Telegram Forwarder] Scheduler shutdown complete.")
+            logger.debug("[Main] 调度器已关闭。")
 
         # 2. Client Disconnect Strategy
-        # 如果配置了 force_disconnect=True，则强制断开连接
-        # 否则保持连接在缓存中，以便下次重载时快速启动
         force_disconnect = self.config.get("force_disconnect", False)
 
         if self.client_wrapper.client:
             if force_disconnect:
-                logger.info("[Telegram Forwarder] Force disconnecting client...")
+                logger.debug("[Main] 正在强制断开客户端连接...")
                 try:
                     await asyncio.wait_for(
                         self.client_wrapper.client.disconnect(), timeout=1.0
                     )
-                    logger.info("[Telegram Forwarder] Client disconnected.")
-                    # 清理缓存
+                    logger.debug("[Main] 客户端已断开连接。")
                     from .core.client import TelegramClientWrapper
                     TelegramClientWrapper.clear_cache()
                 except asyncio.TimeoutError:
-                    logger.warning("[Telegram Forwarder] Client disconnect timed out!")
+                    logger.warning("[Main] 断开客户端连接超时")
                 except Exception as e:
-                    logger.error(f"[Telegram Forwarder] Error disconnecting client: {e}")
+                    logger.error(f"[Main] 断开客户端连接时出错: {e}")
             else:
-                # 保持连接，仅停止调度器
-                logger.info("[Telegram Forwarder] Keeping client connected for faster reload (cached in memory)")
+                logger.debug("[Main] 保持客户端连接以便快速重载")
 
-        logger.info("[Telegram Forwarder] Plugin Stopped")
+        logger.info("Telegram Forwarder 已停止")
 
     # ================= COMMANDS =================
 

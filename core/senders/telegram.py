@@ -46,6 +46,6 @@ class TelegramSender:
                     if not msgs:
                         continue
                     await self.client.forward_messages(target_entity, msgs)
-                    logger.info(f"Forwarded batch ({len(msgs)} msgs) from {src_channel} to TG")
+                    logger.debug(f"[TGSender] 已转发批次 ({len(msgs)} 条消息) 从 {src_channel} 到 Telegram 目标频道")
             except Exception as e:
-                logger.error(f"TG Forward Error: {e}")
+                logger.error(f"[TGSender] Telegram 转发错误: {e}")

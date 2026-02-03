@@ -1,14 +1,3 @@
-"""
-消息转发核心模块
-
-负责从 Telegram 频道获取消息并转发到目标平台（Telegram 频道或 QQ 群）。
-主要功能：
-- 定期检查频道更新
-- 消息过滤（关键词、正则表达式）
-- 冷启动支持（从指定日期开始）
-- 模块化设计：使用 Monitor -> Sender 模式
-"""
-
 import asyncio
 import re
 import os
@@ -76,256 +65,279 @@ class Forwarder:
 
     async def check_updates(self):
         """
-        检查所有配置的频道更新 (FGSS 模式: Fetch-Gather-Sort-Send)
-
-        架构改进：
-        1. Fetch: 并发获取所有频道的新消息
-        2. Gather: 收集所有消息到全局队列
-        3. Sort: 按消息时间戳排序，确保跨频道时序正确
-        4. Send: 线性发送，避免交错混乱
-
-        优势：
-        - 保证严格的时间顺序（频道B的10:01消息不会在频道A的10:05消息之后）
-        - 避免Head-of-Line Blocking（通过超时控制慢速频道）
-
-        Trade-off:
-        - 稍微增加延迟（等待所有频道完成）
-        - 但换来更好的用户体验（消息按时间线排列）
+        检查所有配置的频道更新并加入待发送队列
         """
-        # 检查连接状态
         if not self.client_wrapper.is_connected():
             return
 
-        # 获取源频道配置列表
+        logger.debug("[Capture] 正在检查 Telegram 频道更新...")
+
         channels_config = self.config.get("source_channels", [])
 
-        async def process_one(cfg):
-            """
-            处理单个频道的配置，返回获取到的消息列表
-
-            Returns:
-                List[Tuple[str, Message]]: (channel_name, message) 元组列表
-            """
+        async def fetch_one(cfg):
             try:
                 channel_name = ""
                 start_date = None
-                default_interval = 0  # Default interval if not specified
+                default_interval = 0
                 interval = default_interval
-                msg_limit = 20  # 默认一次处理20条
+                msg_limit = 20
 
-                # 解析频道配置
                 if isinstance(cfg, dict):
-                    # New config format
                     channel_name = cfg.get("channel_username", "")
-                    if not channel_name:
-                        logger.warning(
-                            f"Skipping channel config with missing 'channel_username': {cfg}"
-                        )
-                        return []
-
+                    if not channel_name: return []
                     s_time = cfg.get("start_time", "")
                     if s_time:
                         try:
-                            start_date = datetime.strptime(s_time, "%Y-%m-%d").replace(
-                                tzinfo=timezone.utc
-                            )
-                        except ValueError:
-                            logger.error(
-                                f"Invalid date format for {channel_name}: {s_time}"
-                            )
-
+                            start_date = datetime.strptime(s_time, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                        except: pass
                     interval = cfg.get("check_interval", default_interval)
                     msg_limit = cfg.get("msg_limit", 20)
-
-                    # Handle config_preset (overrides the above if set)
-                    preset = cfg.get("config_preset", "")
-                    if preset:
-                        try:
-                            # preset format: date|interval|limit
-                            p_parts = [p.strip() for p in preset.split("|")]
-                            if len(p_parts) >= 1 and p_parts[0]:
-                                try:
-                                    start_date = datetime.strptime(
-                                        p_parts[0], "%Y-%m-%d"
-                                    ).replace(tzinfo=timezone.utc)
-                                except ValueError:
-                                    logger.warning(
-                                        f"Invalid date in preset {preset} for {channel_name}"
-                                    )
-
-                            if len(p_parts) >= 2 and p_parts[1].isdigit():
-                                interval = int(p_parts[1])
-
-                            if len(p_parts) >= 3 and p_parts[2].isdigit():
-                                msg_limit = int(p_parts[2])
-
-                            logger.info(
-                                f"Applied preset {preset} for {channel_name}: date={start_date}, int={interval}, limit={msg_limit}"
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"Error applying preset {preset} for {channel_name}: {e}"
-                            )
-
                 elif isinstance(cfg, str):
-                    # Legacy string format: name|date|interval|limit
-                    # 格式：channel_name | start_date | interval | limit
-                    # 示例：xiaoshuwu | 2025-01-01 | 60 | 5
                     parts = [p.strip() for p in cfg.split("|")]
-                    if not parts:
-                        logger.warning(f"Skipping invalid channel string config: {cfg}")
-                        return []
-
+                    if not parts: return []
                     channel_name = parts[0]
-                    ints_found = []
+                else: return []
 
-                    for part in parts[1:]:
-                        if not part:
-                            continue
-                        # 尝试解析为日期
-                        if "-" in part and not start_date:
-                            try:
-                                start_date = datetime.strptime(
-                                    part, "%Y-%m-%d"
-                                ).replace(tzinfo=timezone.utc)
-                                continue
-                            except:
-                                pass
+                if not channel_name: return []
 
-                        # 数字可能是间隔或限制
-                        if part.isdigit():
-                            ints_found.append(int(part))
-
-                    # 分配数字参数
-                    if len(ints_found) >= 1:
-                        interval = ints_found[0]
-                    if len(ints_found) >= 2:
-                        msg_limit = ints_found[1]
-                else:
-                    logger.warning(
-                        f"Skipping unknown channel config type: {type(cfg)} - {cfg}"
-                    )
-                    return []  # Unknown type
-
-                # Ensure channel_name is set
-                if not channel_name:
-                    logger.warning(
-                        f"Channel name could not be determined for config: {cfg}"
-                    )
-                    return []
-
-                # 检查间隔
                 now = datetime.now().timestamp()
                 last_check = self._channel_last_check.get(channel_name, 0)
-                # 使用该频道配置的间隔判断
                 if now - last_check < interval:
-                    return []  # 还没到时间
-
-                # 获取该频道的锁
-                lock = self._get_channel_lock(channel_name)
-
-                # 如果锁被占用，跳过本次检查（非阻塞）
-                if lock.locked():
                     return []
+
+                lock = self._get_channel_lock(channel_name)
+                if lock.locked(): return []
 
                 async with lock:
                     self._channel_last_check[channel_name] = now
-                    # Fetch阶段：只获取消息，不发送
-                    messages = await self._fetch_channel_messages(
-                        channel_name, start_date, msg_limit
-                    )
-                    return [(channel_name, msg) for msg in messages]
-
-            except asyncio.CancelledError:
-                raise
+                    logger.debug(f"[Capture] 正在拉取频道 {channel_name} 的消息...")
+                    messages = await self._fetch_channel_messages(channel_name, start_date, msg_limit)
+                    
+                    if messages:
+                        logger.debug(f"[Capture] 从频道 {channel_name} 捕获到 {len(messages)} 条新消息，准备持久化。")
+                        for m in messages:
+                            self.storage.add_to_pending_queue(channel_name, m.id, m.date.timestamp(), m.grouped_id)
+                    else:
+                        logger.debug(f"[Capture] 频道 {channel_name} 没有新消息。")
+                    return messages
             except Exception as e:
-                # 记录错误但继续处理其他频道
-                logger.error(f"Error checking {cfg}: {e}")
+                logger.error(f"[Capture] 获取 {cfg} 失败: {e}")
                 return []
 
-        # ========== Phase 1 & 2: Fetch & Gather ==========
-        # 并行获取所有频道的新消息，设置超时以避免 Head-of-Line Blocking
-        FETCH_TIMEOUT = 15  # 15秒超时，避免慢速频道拖累整体
+        tasks = [fetch_one(cfg) for cfg in channels_config]
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        await self.send_pending_messages()
+
+    async def send_pending_messages(self):
+        """
+        从待发送队列中提取消息并执行转发
+        """
+        logger.debug("[Send] 正在检测待发送队列...")
+        batch_limit = self.config.get("batch_size_limit", 3)
+        retention = self.config.get("retention_period", 86400)
+        now_ts = datetime.now().timestamp()
+
+        all_pending = self.storage.get_all_pending()
+        if not all_pending:
+            logger.debug("[Send] 待发送队列为空。")
+            return
+
+        valid_pending = []
+        expired_count = 0
+        for item in all_pending:
+            if now_ts - item["time"] <= retention:
+                valid_pending.append(item)
+            else:
+                expired_count += 1
+        
+        if expired_count > 0:
+            logger.debug(f"[Send] 自动清理了 {expired_count} 条已过期消息。")
+            self._update_storage_queues(valid_pending)
+
+        if not valid_pending:
+            return
+
+        valid_pending.sort(key=lambda x: x["time"], reverse=True)
+
+        to_send_meta = []
+        processed_ids = set()
+        logical_count = 0 
+        
+        for item in valid_pending:
+            if logical_count >= batch_limit:
+                break
+            
+            if item["id"] in processed_ids:
+                continue
+            
+            if item.get("grouped_id"):
+                gid = item["grouped_id"]
+                channel = item["channel"]
+                album_items = [i for i in valid_pending if i.get("grouped_id") == gid and i["channel"] == channel]
+                for a_item in album_items:
+                    if a_item["id"] not in processed_ids:
+                        to_send_meta.append(a_item)
+                        processed_ids.add(a_item["id"])
+                logical_count += 1 
+            else:
+                to_send_meta.append(item)
+                processed_ids.add(item["id"])
+                logical_count += 1 
+
+        if not to_send_meta:
+            return
+
+        channel_to_ids = {}
+        for item in to_send_meta:
+            c = item["channel"]
+            if c not in channel_to_ids: channel_to_ids[c] = []
+            channel_to_ids[c].append(item["id"])
+
+        messages_to_process = []
+        filter_keywords = self.config.get("filter_keywords", [])
+        filter_regex = self.config.get("filter_regex", "")
+        filter_hashtags = self.config.get("filter_hashtags", [])
+
+        for channel, ids in channel_to_ids.items():
+            try:
+                msgs = await self.client.get_messages(channel, ids=ids)
+                for m in msgs:
+                    if not m: continue
+                    
+                    text_content = m.text or ""
+                    should_skip = False
+                    
+                    if filter_hashtags:
+                        for tag in filter_hashtags:
+                            if tag in text_content:
+                                logger.debug(f"[Filter] {m.id}: 命中 Hashtag '{tag}'")
+                                should_skip = True; break
+                    
+                    if not should_skip and filter_keywords:
+                        for kw in filter_keywords:
+                            if kw in text_content:
+                                logger.debug(f"[Filter] {m.id}: 命中关键词 '{kw}'")
+                                should_skip = True; break
+                    
+                    if not should_skip and filter_regex:
+                        if re.search(filter_regex, text_content, re.IGNORECASE | re.DOTALL):
+                            logger.debug(f"[Filter] {m.id}: 命中正则匹配")
+                            should_skip = True
+                    
+                    if not should_skip:
+                        messages_to_process.append((channel, m))
+            except Exception as e:
+                logger.error(f"[Send] 拉取消息失败 {channel}: {e}")
+
+        if not messages_to_process:
+            sent_ids = [item["id"] for item in to_send_meta]
+            remaining_pending = [item for item in valid_pending if item["id"] not in sent_ids]
+            self._update_storage_queues(remaining_pending)
+            return
+
+        final_batches = []
+        msg_map = {m.id: (c, m) for c, m in messages_to_process}
+        processed_ids_in_send = set()
+        
+        for item in to_send_meta:
+            mid = item["id"]
+            if mid in msg_map and mid not in processed_ids_in_send:
+                if item.get("grouped_id"):
+                    gid = item["grouped_id"]
+                    album_items = [i for i in to_send_meta if i.get("grouped_id") == gid]
+                    album_msgs = []
+                    for ai in album_items:
+                        if ai["id"] in msg_map:
+                            album_msgs.append(msg_map[ai["id"]][1])
+                            processed_ids_in_send.add(ai["id"])
+                    
+                    album_msgs.sort(key=lambda m: m.date)
+                    final_batches.append(album_msgs)
+                else:
+                    final_batches.append([msg_map[mid][1]])
+                    processed_ids_in_send.add(mid)
 
         try:
-            # 并发执行所有频道的 Fetch 任务
-            tasks = [process_one(cfg) for cfg in channels_config]
-            if tasks:
-                # 使用 gather 并设置超时
-                all_channel_messages = await asyncio.wait_for(
-                    asyncio.gather(*tasks, return_exceptions=True),
-                    timeout=FETCH_TIMEOUT,
-                )
-
-                # 合并所有频道的消息
-                global_message_queue = []
-                for channel_messages in all_channel_messages:
-                    if isinstance(channel_messages, Exception):
-                        logger.error(f"Channel fetch failed: {channel_messages}")
-                        continue
-                    if channel_messages:
-                        global_message_queue.extend(channel_messages)
-
-                # ========== Phase 3: Sort ==========
-                # 按消息时间戳排序，确保跨频道时序正确
-                if global_message_queue:
-                    # 按 message.date 排序（从旧到新）
-                    global_message_queue.sort(key=lambda x: x[1].date)
-
-                    logger.info(
-                        f"[FGSS] Sorted {len(global_message_queue)} messages from {len(channels_config)} channels by timestamp"
-                    )
-
-                    # ========== Phase 4: Send ==========
-                    # 线性发送，严格按时间顺序
-                    await self._send_sorted_messages(global_message_queue)
-
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"[FGSS] Fetch phase timeout after {FETCH_TIMEOUT}s, sending partial results"
-            )
-            # 发送已获取的消息
-            if "global_message_queue" in locals() and global_message_queue:
-                global_message_queue.sort(key=lambda x: x[1].date)
-                await self._send_sorted_messages(global_message_queue)
-        except asyncio.CancelledError:
-            logger.info("[FGSS] Check updates cancelled")
-            raise
+            if final_batches:
+                await self._send_sorted_messages_in_batches(final_batches, to_send_meta[0]['channel'])
         except Exception as e:
-            logger.error(f"[FGSS] Error in check_updates: {e}")
+            logger.error(f"[Send] 转发过程出现错误: {e}")
+        finally:
+            sent_ids = [item["id"] for item in to_send_meta]
+            remaining_pending = [item for item in valid_pending if item["id"] not in sent_ids]
+            self._update_storage_queues(remaining_pending)
+            
+            if sent_ids:
+                logger.debug(f"[Send] 批次处理完成。队列剩余: {len(remaining_pending)} 条消息。")
+
+    async def _send_sorted_messages_in_batches(self, batches: List[List[Message]], src_channel: str):
+        """发送排好序的消息批次"""
+        async with self._global_send_lock:
+            # 1. 转发到 QQ
+            await self.qq_sender.send(batches, src_channel)
+            
+            # 2. 转发到 Telegram
+            await self.tg_sender.send(batches, src_channel)
+
+    def _update_storage_queues(self, flat_pending_list: list):
+        """
+        将打平的待发送列表重新按频道分组并更新到 storage
+        """
+        # 1. 首先清空所有频道的队列（或者只处理涉及到的频道）
+        # 这里为了安全，我们先按频道分组
+        channel_queues = {}
+        for item in flat_pending_list:
+            c = item["channel"]
+            if c not in channel_queues:
+                channel_queues[c] = []
+            
+            # 构造原始存储格式
+            channel_queues[c].append({
+                "id": item["id"],
+                "time": item["time"],
+                "grouped_id": item.get("grouped_id")
+            })
+        
+        # 2. 获取 storage 中当前已知的所有频道
+        all_channels = self.config.get("source_channels", [])
+        channel_names = []
+        for cfg in all_channels:
+            if isinstance(cfg, dict):
+                channel_names.append(cfg.get("channel_username"))
+            elif isinstance(cfg, str):
+                channel_names.append(cfg.split("|")[0].strip())
+        
+        # 3. 更新 storage
+        for cname in channel_names:
+            if not cname: continue
+            new_queue = channel_queues.get(cname, [])
+            self.storage.update_pending_queue(cname, new_queue)
 
     async def _fetch_channel_messages(
         self, channel_name: str, start_date: Optional[datetime], msg_limit: int = 20
     ) -> List[Message]:
         """
-        Fetch阶段：从单个频道获取新消息（不发送）
-
-        Returns:
-            List[Message]: 获取到的新消息列表
-
-        Note:
-            此方法只负责获取消息，过滤和发送在后续阶段处理
+        从单个频道获取新消息
         """
-        # ========== 初始化频道状态 ==========
         if not self.storage.get_channel_data(channel_name).get("last_post_id"):
             self.storage.update_last_id(channel_name, 0)
 
         last_id = self.storage.get_channel_data(channel_name)["last_post_id"]
 
         try:
-            # ========== 冷启动处理 ==========
             if last_id == 0:
                 if start_date:
-                    logger.info(f"Cold start for {channel_name} with date {start_date}")
-                    pass  # 逻辑在迭代参数中处理
+                    logger.debug(f"[Fetch] {channel_name} 正在从 {start_date} 开始冷启动...")
+                    pass
                 else:
                     msgs = await self.client.get_messages(channel_name, limit=1)
                     if msgs:
                         self.storage.update_last_id(channel_name, msgs[0].id)
-                        logger.info(f"Initialized {channel_name} at ID {msgs[0].id}")
+                        logger.debug(f"[Fetch] {channel_name} 初始化成功，起始 ID: {msgs[0].id}")
                     return []
 
-            # ========== 获取新消息 ==========
             new_messages = []
             params = {"entity": channel_name, "reverse": True, "limit": msg_limit}
 
@@ -334,162 +346,25 @@ class Forwarder:
             elif start_date:
                 params["offset_date"] = start_date
             else:
-                params["limit"] = 5  # 默认初始化获取5条
+                params["limit"] = 5
 
             async for message in self.client.iter_messages(**params):
                 if not message.id:
                     continue
                 new_messages.append(message)
 
-            # 更新 last_post_id（无论消息是否会被过滤）
             if new_messages:
                 max_id = max(m.id for m in new_messages)
                 self.storage.update_last_id(channel_name, max_id)
-                logger.info(
-                    f"[Fetch] {channel_name}: fetched {len(new_messages)} messages (max_id: {max_id})"
+                logger.debug(
+                    f"[Fetch] {channel_name}: 成功获取 {len(new_messages)} 条新消息 (max_id: {max_id})"
                 )
 
             return new_messages
 
         except Exception as e:
-            logger.error(f"[Fetch] Error accessing {channel_name}: {e}")
+            logger.error(f"[Fetch] 访问 {channel_name} 失败: {e}")
             return []
-
-    async def _send_sorted_messages(self, sorted_messages: List[tuple]):
-        """
-        Send阶段：发送已排序的消息（应用过滤和相册处理）
-
-        Args:
-            sorted_messages: 已按时间排序的 (channel_name, message) 元组列表
-
-        处理流程：
-        1. 过滤不想要的消息（关键词、正则、hashtag）
-        2. 识别相册（grouped_id）并分组
-        3. 按顺序发送每个批次
-        """
-        filter_keywords = self.config.get("filter_keywords", [])
-        filter_regex = self.config.get("filter_regex", "")
-        filter_hashtags = self.config.get("filter_hashtags", [])
-
-        # ========== Phase 1: 过滤消息 ==========
-        filtered_messages = []
-        for channel_name, msg in sorted_messages:
-            try:
-                # ----- 反垃圾 / 频道过滤 -----
-                is_user_msg = (
-                    isinstance(msg.from_id, PeerUser) if msg.from_id else False
-                )
-                if not msg.post and is_user_msg:
-                    continue
-
-                text_content = msg.text or ""
-                should_skip = False
-
-                # Hashtag 过滤
-                if filter_hashtags:
-                    for tag in filter_hashtags:
-                        if tag in text_content:
-                            logger.info(f"[Filter] {msg.id}: Hashtag '{tag}'")
-                            should_skip = True
-                            break
-
-                # Keyword 过滤
-                if not should_skip and filter_keywords:
-                    for kw in filter_keywords:
-                        if kw in text_content:
-                            logger.info(f"[Filter] {msg.id}: Keyword '{kw}'")
-                            should_skip = True
-                            break
-
-                # Regex 过滤
-                if not should_skip and filter_regex:
-                    if re.search(filter_regex, text_content, re.IGNORECASE | re.DOTALL):
-                        logger.info(f"[Filter] {msg.id}: Regex match")
-                        should_skip = True
-
-                if not should_skip:
-                    filtered_messages.append((channel_name, msg))
-            except Exception as e:
-                logger.error(f"[Filter] Error filtering msg {msg.id}: {e}")
-
-        if not filtered_messages:
-            logger.info("[Send] All messages were filtered, nothing to send")
-            return
-
-        logger.info(
-            f"[Send] {len(filtered_messages)} messages after filtering (from {len(sorted_messages)} fetched)"
-        )
-
-        # ========== Phase 2: 相册分组 (修正版) ==========
-        # 使用字典按 (channel_name, grouped_id) 聚合，确保跨消息的相册也能正确合并
-        album_groups = {}
-        batches = []
-
-        for channel_name, msg in filtered_messages:
-            if msg.grouped_id:
-                key = (channel_name, msg.grouped_id)
-                if key not in album_groups:
-                    album_groups[key] = []
-                album_groups[key].append((channel_name, msg))
-            else:
-                batches.append([(channel_name, msg)])
-
-        # 将聚合好的相册添加到批次中
-        for group in album_groups.values():
-            batches.append(group)
-
-        # 重新按第一条消息的时间排序，确保发送顺序大致正确
-        if batches:
-            batches.sort(key=lambda batch: batch[0][1].date)
-
-        logger.info(
-            f"[Send] Organized into {len(batches)} batches (albums={len(album_groups)}, singles={len(batches) - len(album_groups)})"
-        )
-
-        # ========== Phase 3: 线性发送 ==========
-        # 使用全局锁确保原子性，按顺序发送每个批次
-        async with self._global_send_lock:
-            for batch_idx, batch in enumerate(batches):
-                try:
-                    # 提取消息对象和源频道
-                    messages = [msg for _, msg in batch]
-                    src_channel = batch[0][0]  # 获取源频道名称
-
-                    # 判断批次类型（相册或单条消息）
-                    if len(messages) > 1:
-                        # 相册：所有消息的 grouped_id 相同
-                        batch_type = "album"
-                        grouped_id = messages[0].grouped_id
-                        logger.info(
-                            f"[Send] Batch {batch_idx + 1}/{len(batches)}: Album from {src_channel} (grouped_id={grouped_id}, {len(messages)} photos)"
-                        )
-                    else:
-                        # 单条消息
-                        batch_type = "single"
-                        msg = messages[0]
-                        msg_preview = (
-                            (msg.text[:30] + "...")
-                            if msg.text
-                            else f"[Media: {type(msg.media).__name__}]"
-                        )
-                        logger.info(
-                            f"[Send] Batch {batch_idx + 1}/{len(batches)}: Single msg {msg.id} from {src_channel} ({msg_preview})"
-                        )
-
-                    # 将批次转换为 Sender 期望的格式: List[List[Message]], src_channel
-                    sender_batches = [messages]
-
-                    # 并行发送到各平台
-                    await asyncio.gather(
-                        self.tg_sender.send(sender_batches, src_channel),
-                        self.qq_sender.send(sender_batches, src_channel),
-                    )
-
-                except Exception as e:
-                    logger.error(f"[Send] Error sending batch {batch_idx + 1}: {e}")
-                    # 继续发送下一个批次
-
-        logger.info(f"[Send] Completed sending {len(batches)} batches")
 
     def _cleanup_orphaned_files(self):
         """
@@ -498,9 +373,7 @@ class Forwarder:
         if not os.path.exists(self.plugin_data_dir):
             return
 
-        logger.info(f"Cleaning up orphaned files in {self.plugin_data_dir}...")
-        # 允许保留的文件列表
-        # .session-journal, .session-shm, .session-wal 是 SQLite 的临时文件，必须保留以防止数据库损坏
+        logger.debug(f"[Cleanup] 正在清理临时文件: {self.plugin_data_dir}")
         allowlist = [
             "data.json",
             "user_session.session",
@@ -517,7 +390,6 @@ class Forwarder:
 
                 file_path = os.path.join(self.plugin_data_dir, filename)
 
-                # 只删除文件，不删除子目录
                 if os.path.isfile(file_path):
                     try:
                         os.remove(file_path)
@@ -526,9 +398,7 @@ class Forwarder:
                         pass
 
             if deleted_count > 0:
-                logger.info(
-                    f"Cleanup finished. Removed {deleted_count} orphaned files."
-                )
+                logger.debug(f"[Cleanup] 清理完成，移除了 {deleted_count} 个孤儿文件。")
 
         except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
+            logger.error(f"[Cleanup] 清理文件失败: {e}")
