@@ -1,5 +1,4 @@
 import asyncio
-import re
 import os
 from datetime import datetime, timezone
 from typing import Optional, List
@@ -12,6 +11,9 @@ from .downloader import MediaDownloader
 from .uploader import FileUploader
 from .senders.telegram import TelegramSender
 from .senders.qq import QQSender
+from .filters.message_filter import MessageFilter
+from .mergers import MessageMerger
+from .config import ChannelConfigParser
 
 
 class Forwarder:
@@ -47,6 +49,10 @@ class Forwarder:
         # 初始化发送器
         self.tg_sender = TelegramSender(self.client, config)
         self.qq_sender = QQSender(self.context, config, self.downloader, self.uploader)
+
+        # 初始化过滤器和合并引擎
+        self.message_filter = MessageFilter(config)
+        self.message_merger = MessageMerger(config)
 
         # 启动时清理孤儿文件
         self._cleanup_orphaned_files()
