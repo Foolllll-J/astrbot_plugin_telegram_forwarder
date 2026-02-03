@@ -5,7 +5,7 @@ from typing import List
 from telethon.tl.types import Message
 from astrbot.api import logger, AstrBotConfig, star
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import Plain, Image, Record
+from astrbot.api.message_components import Plain, Image, Record, Video
 
 from ...common.text_tools import clean_telegram_text
 from ..downloader import MediaDownloader
@@ -113,6 +113,9 @@ class QQSender:
                                     message_chain.chain.append(Image.fromFileSystem(fpath))
                                 elif ext in [".mp3", ".ogg", ".wav", ".m4a", ".flac", ".amr"]:
                                     message_chain.chain.append(Record.fromFileSystem(fpath))
+                                elif ext in [".mp4", ".mov", ".avi", ".mkv", ".flv"]:
+                                    # 视频文件使用 Video 组件
+                                    message_chain.chain.append(Video.fromFileSystem(fpath))
                                 else:
                                     # 其他文件类型暂不支持直接发送，可以发送一个提示
                                     message_chain.chain.append(Plain(f"\n[File: {os.path.basename(fpath)}]"))
@@ -254,7 +257,7 @@ class QQSender:
                             {"type": "record", "data": {"file": link}},
                         ]
 
-                    # 普通文件/大图片
+                    # 普通文件/大图片/视频
                     return [
                         {"type": "text", "data": {"text": f"\n[Media Link: {link}]"}}
                     ]
