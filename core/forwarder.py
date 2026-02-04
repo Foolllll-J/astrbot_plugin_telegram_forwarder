@@ -76,9 +76,8 @@ class Forwarder:
         if not self.client_wrapper.is_connected():
             return
 
-        logger.debug("[Capture] 正在检查 Telegram 频道更新...")
-
         channels_config = self.config.get("source_channels", [])
+        logger.debug(f"[Capture] 开始检查 Telegram 频道更新 (共 {len(channels_config)} 个频道)...")
 
         async def fetch_one(cfg):
             try:
@@ -122,15 +121,25 @@ class Forwarder:
                     messages = await self._fetch_channel_messages(channel_name, start_date, msg_limit)
                     
                     if messages:
-                        logger.debug(f"[Capture] 从频道 {channel_name} 捕获到 {len(messages)} 条新消息，已加入待发送队列。")
+                        # 先加入队列，再更新 last_id
                         for m in messages:
                             self.storage.add_to_pending_queue(channel_name, m.id, m.date.timestamp(), m.grouped_id)
+                        
+                        max_id = max(m.id for m in messages)
+                        self.storage.update_last_id(channel_name, max_id)
+                        
+                        logger.debug(f"[Capture] 频道 {channel_name} 的 {len(messages)} 条新消息已成功存入本地待发送队列，并更新 last_id 为 {max_id}。")
                     else:
-                        logger.debug(f"[Capture] 频道 {channel_name} 没有新消息。")
+                        logger.debug(f"[Capture] 频道 {channel_name} 检查完成，无新消息。")
                     return messages
             except Exception as e:
-                logger.error(f"[Capture] 获取 {cfg} 失败: {e}")
+                logger.error(f"[Capture] 检查频道 {cfg} 时出现未捕获异常: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
                 return []
+            finally:
+                if 'channel_name' in locals() and channel_name:
+                    logger.debug(f"[Capture] 频道 {channel_name} 检查任务结束。")
 
         tasks = [fetch_one(cfg) for cfg in channels_config]
         if tasks:
@@ -142,10 +151,19 @@ class Forwarder:
         """
         all_pending = self.storage.get_all_pending()
         queue_size = len(all_pending) if all_pending else 0
-        logger.info(f"[Send] 正在检测待发送队列... 当前队列大小: {queue_size}")
         
         if not all_pending:
+            logger.debug("[Send] 正在检测待发送队列... 队列为空，无需处理。")
             return
+
+        # 统计各频道积压情况
+        stats = {}
+        for item in all_pending:
+            c = item["channel"]
+            stats[c] = stats.get(c, 0) + 1
+        
+        stats_str = ", ".join([f"{c}: {n}条" for c, n in stats.items()])
+        logger.debug(f"[Send] 正在检测待发送队列... 总计: {queue_size} 条消息 | 积压详情: {stats_str}")
 
         batch_limit = self.config.get("batch_size_limit", 3)
         retention = self.config.get("retention_period", 86400)
@@ -160,16 +178,18 @@ class Forwarder:
                 expired_count += 1
         
         if expired_count > 0:
-            logger.info(f"[Send] 自动清理了 {expired_count} 条已过期消息。")
-            self._update_storage_queues(valid_pending)
+            self.storage.cleanup_expired_pending(retention)
+            # 重新获取一下，因为清理了过期消息
+            all_pending = self.storage.get_all_pending()
+            valid_pending = all_pending # 此时 all_pending 已经是清理过的了
 
         if not valid_pending:
-            logger.info("[Send] 过滤过期消息后，待发送队列为空。")
+            logger.debug("[Send] 待发送队列为空。")
             return
 
         valid_pending.sort(key=lambda x: x["time"], reverse=True)
         
-        logger.info(f"[Send] 准备处理 {min(len(valid_pending), batch_limit)} 个逻辑批次 (batch_limit={batch_limit})")
+        logger.debug(f"[Send] 准备处理 {min(len(valid_pending), batch_limit)} 个逻辑批次 (batch_limit={batch_limit})")
 
         to_send_meta = []
         processed_ids = set()
@@ -242,15 +262,25 @@ class Forwarder:
                     # 关键词/正则/Hashtag 过滤 (检查正文 + 按钮)
                     check_text_lower = full_check_text.lower()
                     
+                    def is_keyword_matched(pattern_str, text):
+                        pattern_str = pattern_str.lower()
+                        if not pattern_str: return False
+                        if pattern_str.isascii():
+                            # 使用自定义边界：前后不能是英文字母或数字
+                            regex_pattern = rf"(?<![a-zA-Z0-9]){re.escape(pattern_str)}(?![a-zA-Z0-9])"
+                            return bool(re.search(regex_pattern, text, re.IGNORECASE))
+                        # 对于包含非 ASCII（如中文）的关键词，维持原有的子串匹配
+                        return pattern_str in text
+
                     if filter_hashtags:
                         for tag in filter_hashtags:
-                            if tag.lower() in check_text_lower:
+                            if is_keyword_matched(tag, check_text_lower):
                                 logger.info(f"[Filter] 消息 {m.id} 命中 Hashtag '{tag}'")
                                 should_skip = True; break
                     
                     if not should_skip and filter_keywords:
                         for kw in filter_keywords:
-                            if kw.lower() in check_text_lower:
+                            if is_keyword_matched(kw, check_text_lower):
                                 logger.info(f"[Filter] 消息 {m.id} 命中关键词 '{kw}'")
                                 should_skip = True; break
                     
@@ -284,8 +314,16 @@ class Forwarder:
 
         if not messages_to_process:
             processed_ids = [item["id"] for item in to_send_meta]
-            remaining_pending = [item for item in valid_pending if item["id"] not in processed_ids]
-            self._update_storage_queues(remaining_pending)
+            # 建立频道到 ID 的反向索引，用于精确移除
+            chan_to_ids_processed = {}
+            for item in to_send_meta:
+                c = item["channel"]
+                if c not in chan_to_ids_processed: chan_to_ids_processed[c] = []
+                chan_to_ids_processed[c].append(item["id"])
+            
+            for channel, ids in chan_to_ids_processed.items():
+                self.storage.remove_ids_from_pending(channel, ids)
+
             logger.info(f"[Send] 本批次所有消息 ({len(processed_ids)} 条) 均被过滤或获取失败，已从队列移除。")
             return
 
@@ -321,18 +359,28 @@ class Forwarder:
         except Exception as e:
             logger.error(f"[Send] 转发过程出现错误: {e}")
         finally:
-            processed_ids = [item["id"] for item in to_send_meta]
-            remaining_pending = [item for item in valid_pending if item["id"] not in processed_ids]
-            self._update_storage_queues(remaining_pending)
+            # 建立频道到 ID 的反向索引，用于精确移除
+            chan_to_ids_processed = {}
+            for item in to_send_meta:
+                c = item["channel"]
+                if c not in chan_to_ids_processed: chan_to_ids_processed[c] = []
+                chan_to_ids_processed[c].append(item["id"])
             
-            if processed_ids:
-                skipped_count = len(processed_ids) - actual_sent_count
-                msg = f"[Send] 批次处理完成。本批次共处理 {len(processed_ids)} 条："
+            for channel, ids in chan_to_ids_processed.items():
+                self.storage.remove_ids_from_pending(channel, ids)
+            
+            if to_send_meta:
+                processed_count = len(to_send_meta)
+                skipped_count = processed_count - actual_sent_count
+                msg = f"[Send] 批次处理完成。本批次共处理 {processed_count} 条："
                 if actual_sent_count > 0:
                     msg += f" 成功发送 {actual_sent_count} 条；"
                 if skipped_count > 0:
                     msg += f" 过滤/跳过 {skipped_count} 条；"
-                msg += f"队列剩余: {len(remaining_pending)} 条。"
+                
+                # 获取最新队列大小
+                new_all_pending = self.storage.get_all_pending()
+                msg += f"队列剩余: {len(new_all_pending)} 条。"
                 logger.info(msg)
 
     async def _send_sorted_messages_in_batches(self, batches_with_channel: List[tuple]):
@@ -345,32 +393,6 @@ class Forwarder:
                 # 2. 转发到 Telegram
                 await self.tg_sender.send([msgs], src_channel)
 
-    def _update_storage_queues(self, flat_pending_list: list):
-        """
-        将打平的待发送列表重新按频道分组并更新到 storage
-        """
-        # 1. 首先确定哪些频道需要被清空或更新（涉及到的频道）
-        all_channels = list(self.storage.persistence.get("channels", {}).keys())
-        
-        # 2. 按频道分组传入的消息
-        channel_queues = {c: [] for c in all_channels}
-        for item in flat_pending_list:
-            c = item["channel"]
-            if c not in channel_queues:
-                channel_queues[c] = []
-            channel_queues[c].append({
-                "id": item["id"],
-                "time": item["time"],
-                "grouped_id": item.get("grouped_id")
-            })
-
-        # 3. 逐个更新
-        for channel_name, queue in channel_queues.items():
-            self.storage.update_pending_queue(channel_name, queue)
-        
-        # 4. 强制执行一次全局保存，确保 JSON 文件更新
-        self.storage.save()
-
     async def _fetch_channel_messages(
         self, channel_name: str, start_date: Optional[datetime], msg_limit: int = 20
     ) -> List[Message]:
@@ -381,17 +403,18 @@ class Forwarder:
             self.storage.update_last_id(channel_name, 0)
 
         last_id = self.storage.get_channel_data(channel_name)["last_post_id"]
+        logger.debug(f"[Fetch] 频道: {channel_name} | 记录的最新 ID (last_id): {last_id}")
 
         try:
             if last_id == 0:
                 if start_date:
-                    logger.debug(f"[Fetch] {channel_name} 正在从 {start_date} 开始冷启动...")
+                    logger.info(f"[Fetch] {channel_name} 正在从 {start_date} 开始冷启动...")
                     pass
                 else:
                     msgs = await self.client.get_messages(channel_name, limit=1)
                     if msgs:
                         self.storage.update_last_id(channel_name, msgs[0].id)
-                        logger.debug(f"[Fetch] {channel_name} 初始化成功，起始 ID: {msgs[0].id}")
+                        logger.info(f"[Fetch] {channel_name} 首次运行/冷启动，已同步当前最新 ID: {msgs[0].id}，下次抓取将从此开始。")
                     return []
 
             new_messages = []
@@ -399,6 +422,7 @@ class Forwarder:
 
             if last_id > 0:
                 params["min_id"] = last_id
+                logger.debug(f"[Fetch] {channel_name} 发起请求: min_id={last_id}, limit={msg_limit}")
             elif start_date:
                 params["offset_date"] = start_date
             else:
@@ -410,11 +434,14 @@ class Forwarder:
                 new_messages.append(message)
 
             if new_messages:
-                max_id = max(m.id for m in new_messages)
-                self.storage.update_last_id(channel_name, max_id)
                 logger.debug(
-                    f"[Fetch] {channel_name}: 成功获取 {len(new_messages)} 条新消息 (max_id: {max_id})"
+                    f"[Fetch] {channel_name}: 抓取成功！获取到 {len(new_messages)} 条新消息 (范围: {min(m.id for m in new_messages)} -> {max(m.id for m in new_messages)})"
                 )
+            else:
+                # 即使没有新消息，我们也尝试获取一下频道当前的最新 ID 用于日志显示
+                latest_msgs = await self.client.get_messages(channel_name, limit=1)
+                latest_id_on_tg = latest_msgs[0].id if latest_msgs else "未知"
+                logger.debug(f"[Fetch] {channel_name}: 没有新消息。 (当前 TG 最新 ID: {latest_id_on_tg})")
 
             return new_messages
 

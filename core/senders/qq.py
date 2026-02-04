@@ -5,7 +5,7 @@ from typing import List
 from telethon.tl.types import Message
 from astrbot.api import logger, AstrBotConfig, star
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import Plain, Image, Record, Video, Node, Nodes
+from astrbot.api.message_components import Plain, Image, Record, Video, Node, Nodes, File
 
 from ...common.text_tools import clean_telegram_text
 from ..downloader import MediaDownloader
@@ -112,92 +112,122 @@ class QQSender:
             else:
                 logger.warning(f"[QQSender] 未获取到 bot 实例，将使用默认名称 '{node_name}'")
 
+            # 预处理所有批次的消息，避免多群转发时重复下载
+            processed_batches = []
+            for msgs in batches:
+                all_local_files = []
+                all_nodes_data = [] 
+                try:
+                    header = f"From #{src_channel}:"
+                    for i, msg in enumerate(msgs):
+                        current_node_components = []
+                        text_parts = []
+                        if msg.text:
+                            cleaned = clean_telegram_text(msg.text)
+                            if cleaned: text_parts.append(cleaned)
+                        
+                        media_components = []
+                        has_any_attachment = False
+                        files = await self.downloader.download_media(msg)
+                        for fpath in files:
+                            all_local_files.append(fpath)
+                            has_any_attachment = True
+                            ext = os.path.splitext(fpath)[1].lower()
+                            if ext in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"]:
+                                media_components.append(Image.fromFileSystem(fpath))
+                            elif ext == ".wav":
+                                media_components.append(Record.fromFileSystem(fpath))
+                            elif ext == ".mp4":
+                                media_components.append(Video.fromFileSystem(fpath))
+                            else:
+                                media_components.append(File(file=fpath, name=os.path.basename(fpath)))
+
+                        should_exclude_text = exclude_text_on_media and has_any_attachment
+                        if i == 0 and not should_exclude_text:
+                            if text_parts:
+                                text_parts[0] = f"{header}\n\u200b{text_parts[0]}"
+                            else:
+                                current_node_components.append(Plain(f"{header}\n\u200b"))
+
+                        if not should_exclude_text:
+                            for t in text_parts:
+                                current_node_components.append(Plain(t + "\n"))
+                        
+                        current_node_components.extend(media_components)
+                        if current_node_components:
+                            is_only_header = (i == 0 and len(current_node_components) == 1 and 
+                                             isinstance(current_node_components[0], Plain) and 
+                                             current_node_components[0].text in [header, header + "\n", f"{header}\n\u200b"])
+                            if not is_only_header:
+                                all_nodes_data.append(current_node_components)
+
+                    if all_nodes_data:
+                        processed_batches.append({
+                            "nodes_data": all_nodes_data,
+                            "local_files": all_local_files
+                        })
+                except Exception as e:
+                    logger.error(f"[QQSender] 预处理消息批次异常: {e}")
+                    self._cleanup_files(all_local_files)
+
+            # 发送到各个目标群组
             for gid in qq_groups:
                 if not gid:
                     continue
                 
                 lock = self._get_lock(gid)
                 async with lock:
-                    for msgs in batches:
-                        all_local_files = []
-                        all_nodes_data = [] 
-                        
+                    unified_msg_origin = f"{qq_platform_id}:GroupMessage:{gid}"
+                    for batch_data in processed_batches:
+                        all_nodes_data = batch_data["nodes_data"]
                         try:
-                            header = f"From #{src_channel}:"
-                            
-                            for i, msg in enumerate(msgs):
-                                current_node_components = []
-                                
-                                # 处理文本
-                                text_parts = []
-                                if msg.text:
-                                    cleaned = clean_telegram_text(msg.text)
-                                    if cleaned:
-                                        text_parts.append(cleaned)
-                                
-                                # 处理媒体
-                                media_components = []
-                                files = await self.downloader.download_media(msg)
-                                for fpath in files:
-                                    all_local_files.append(fpath)
-                                    ext = os.path.splitext(fpath)[1].lower()
-                                    if ext in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"]:
-                                        media_components.append(Image.fromFileSystem(fpath))
-                                    elif ext in [".mp3", ".ogg", ".wav", ".m4a", ".flac", ".amr"]:
-                                        media_components.append(Record.fromFileSystem(fpath))
-                                    elif ext in [".mp4", ".mov", ".avi", ".mkv", ".flv"]:
-                                        media_components.append(Video.fromFileSystem(fpath))
-                                    else:
-                                        media_components.append(Plain(f"\n[文件: {os.path.basename(fpath)}]"))
-
-                                has_media = len(media_components) > 0
-                                should_exclude_text = exclude_text_on_media and has_media
-
-                                if i == 0 and not should_exclude_text:
-                                    if text_parts:
-                                        text_parts[0] = f"{header}\n\u200b{text_parts[0]}"
-                                    else:
-                                        current_node_components.append(Plain(f"{header}\n\u200b"))
-
-                                if not should_exclude_text:
-                                    for t in text_parts:
-                                        current_node_components.append(Plain(t + "\n"))
-                                
-                                current_node_components.extend(media_components)
-                                
-                                if current_node_components:
-                                    is_only_header = (i == 0 and len(current_node_components) == 1 and 
-                                                     isinstance(current_node_components[0], Plain) and 
-                                                     current_node_components[0].text in [header, header + "\n", f"{header}\n\u200b"])
-                                    
-                                    if not is_only_header:
-                                        all_nodes_data.append(current_node_components)
-
-                            if not all_nodes_data:
-                                continue
-
-                            message_chain = MessageChain()
                             if len(all_nodes_data) > 1:
+                                # 合并转发模式 (相册)
+                                message_chain = MessageChain()
                                 nodes_list = []
                                 for node_content in all_nodes_data:
                                     nodes_list.append(Node(uin=self_id, name=node_name, content=node_content))
                                 
                                 message_chain.chain.append(Nodes(nodes_list))
-                                log_msg = f"[QQSender] Bot({node_name}) 合并转发相册 ({len(all_nodes_data)} 节点) 到群 {gid}"
+                                await self.context.send_message(unified_msg_origin, message_chain)
+                                logger.info(f"[QQSender] Bot({node_name}) 合并转发相册 ({len(all_nodes_data)} 节点) 到群 {gid}")
                             else:
-                                message_chain.chain.extend(all_nodes_data[0])
-                                log_msg = f"[QQSender] Bot({node_name}) 转发单条消息到群 {gid}"
-
-                            unified_msg_origin = f"{qq_platform_id}:GroupMessage:{gid}"
-                            await self.context.send_message(unified_msg_origin, message_chain)
-                            logger.info(log_msg)
+                                # 单条消息转发模式
+                                 components = all_nodes_data[0]
+                                 special_types = (Record, File, Video)
+                                 has_special = any(isinstance(c, special_types) for c in components)
+                                 
+                                 if has_special:
+                                     # 1. 先逐个发送特殊节点 (视频、语音、文件)
+                                     for c in components:
+                                         if isinstance(c, special_types):
+                                             chain = MessageChain()
+                                             chain.chain.append(c)
+                                             await self.context.send_message(unified_msg_origin, chain)
+                                     
+                                     # 2. 再发送普通节点 (文字、图片)
+                                     common_components = [c for c in components if not isinstance(c, special_types)]
+                                     if common_components:
+                                         chain = MessageChain()
+                                         chain.chain.extend(common_components)
+                                         await self.context.send_message(unified_msg_origin, chain)
+                                     
+                                     logger.info(f"[QQSender] Bot({node_name}) 转发单条消息(包含视频/语音/文件)到群 {gid} (已拆分，媒体优先)")
+                                 else:
+                                     # 普通消息 (仅文字/图片)，尝试一起发送
+                                     message_chain = MessageChain()
+                                     message_chain.chain.extend(components)
+                                     await self.context.send_message(unified_msg_origin, message_chain)
+                                     logger.info(f"[QQSender] Bot({node_name}) 转发单条消息到群 {gid}")
                             
                             await asyncio.sleep(1)
 
                         except Exception as e:
-                            logger.error(f"[QQSender] AstrBot 转发异常: {e}")
-                        finally:
-                            self._cleanup_files(all_local_files)
+                            logger.error(f"[QQSender] 转发到群 {gid} 异常: {e}")
+
+            # 最后清理所有下载的文件
+            for batch_data in processed_batches:
+                self._cleanup_files(batch_data["local_files"])
         else:
             async with httpx.AsyncClient() as http:
                 for gid in qq_groups:
@@ -209,6 +239,7 @@ class QQSender:
                         for msgs in batches:
                             all_local_files = []
                             combined_text_parts = []
+                            has_any_attachment = False # 标记是否包含任何附件
                             
                             try:
                                 for msg in msgs:
@@ -217,7 +248,9 @@ class QQSender:
                                         if cleaned:
                                             combined_text_parts.append(cleaned)
                                     files = await self.downloader.download_media(msg)
-                                    all_local_files.extend(files)
+                                    for fpath in files:
+                                        all_local_files.append(fpath)
+                                        has_any_attachment = True
 
                                 header = f"From #{src_channel}:\n"
                                 if len(set(combined_text_parts)) == 1:
@@ -230,29 +263,44 @@ class QQSender:
                                     continue
 
                                 message = []
-                                if exclude_text_on_media and all_local_files:
+                                if exclude_text_on_media and has_any_attachment:
                                     pass
                                 elif final_text.strip():
                                     message.append({"type": "text", "data": {"text": final_text}})
 
                                 for fpath in all_local_files:
-                                    file_nodes = await self._process_one_file(fpath)
-                                    if file_nodes:
-                                        message.extend(file_nodes)
+                                    ext = os.path.splitext(fpath)[1].lower()
+                                    # 如果是富媒体或文件，且没有配置托管，或者想要直接发送
+                                    # 注意：HTTP 模式下 NapCat 对文件发送的支持取决于其 API 实现
+                                    # 这里我们优先处理图片/视频/语音，其余文件尝试以文件节点发送
+                                    if ext in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"]:
+                                        message.append({"type": "image", "data": {"file": f"file:///{os.path.abspath(fpath)}"}})
+                                    elif ext == ".wav":
+                                        message.append({"type": "record", "data": {"file": f"file:///{os.path.abspath(fpath)}"}})
+                                    elif ext == ".mp4":
+                                        message.append({"type": "video", "data": {"file": f"file:///{os.path.abspath(fpath)}"}})
+                                    else:
+                                        # 其他文件类型，视作文件发送
+                                        message.append({"type": "file", "data": {"file": f"file:///{os.path.abspath(fpath)}", "name": os.path.basename(fpath)}})
 
                                 if not message:
                                     continue
 
                                 try:
-                                    has_record = any(node.get("type") == "record" for node in message)
-                                    if has_record:
-                                        text_nodes = [node for node in message if node.get("type") == "text"]
-                                        if text_nodes:
-                                            await http.post(url, json={"group_id": gid, "message": text_nodes}, timeout=60)
-                                        record_nodes = [node for node in message if node.get("type") == "record"]
-                                        for rec_node in record_nodes:
-                                            await http.post(url, json={"group_id": gid, "message": [rec_node]}, timeout=60)
-                                        logger.info(f"[QQSender] 转发语音消息到群 {gid}")
+                                    special_types = ["record", "file", "video"]
+                                    has_special = any(node.get("type") in special_types for node in message)
+                                    if has_special:
+                                        # 1. 先逐个发送特殊节点 (视频、语音、文件)
+                                        for spec_node in message:
+                                            if spec_node.get("type") in special_types:
+                                                await http.post(url, json={"group_id": gid, "message": [spec_node]}, timeout=60)
+                                        
+                                        # 2. 再发送所有普通节点 (text, image)
+                                        common_nodes = [node for node in message if node.get("type") not in special_types]
+                                        if common_nodes:
+                                            await http.post(url, json={"group_id": gid, "message": common_nodes}, timeout=60)
+                                        
+                                        logger.info(f"[QQSender] 转发包含视频、语音或文件的消息到群 {gid} (已拆分发送，媒体优先)")
                                     else:
                                         await http.post(url, json={"group_id": gid, "message": message}, timeout=60)
                                         logger.info(f"[QQSender] 转发相册/消息 ({len(msgs)} 条) 到群 {gid}")
@@ -314,6 +362,17 @@ class QQSender:
                         {"type": "text", "data": {"text": f"\n[媒体链接: {link}]"}}
                     ]
                 else:
+                    # 如果没有 link 且不是富媒体，尝试直接发送本地文件
+                    if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".mp4", ".mov", ".avi", ".mkv", ".flv"]:
+                        return [
+                            {
+                                "type": "file",
+                                "data": {
+                                    "file": f"file:///{os.path.abspath(fpath)}",
+                                    "name": os.path.basename(fpath)
+                                }
+                            }
+                        ]
                     return [
                         {
                             "type": "text",
@@ -324,6 +383,17 @@ class QQSender:
                     ]
             except Exception as e:
                 logger.error(f"[QQSender] 上传失败: {e}")
+                # 上传失败回退到直接发送本地文件
+                if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".mp4", ".mov", ".avi", ".mkv", ".flv"]:
+                    return [
+                        {
+                            "type": "file",
+                            "data": {
+                                "file": f"file:///{os.path.abspath(fpath)}",
+                                "name": os.path.basename(fpath)
+                            }
+                        }
+                    ]
                 return [
                     {
                         "type": "text",
@@ -333,7 +403,18 @@ class QQSender:
                     }
                 ]
 
-        # 3. 回退方案
+        # 3. 回退方案：如果没有配置托管，对于普通文件尝试直接发送
+        if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".mp4", ".mov", ".avi", ".mkv", ".flv"]:
+            return [
+                {
+                    "type": "file",
+                    "data": {
+                        "file": f"file:///{os.path.abspath(fpath)}",
+                        "name": os.path.basename(fpath)
+                    }
+                }
+            ]
+        
         fname = os.path.basename(fpath)
         return [
             {

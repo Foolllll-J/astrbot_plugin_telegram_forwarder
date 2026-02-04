@@ -29,43 +29,13 @@ class Main(star.Star):
         super().__init__(context)
         self.context = context
         self.config = config
-        self.bot = None # 初始化 bot 属性，防止 on_qq_message 报错
+        self.bot = None
 
 
         # ========== 设置数据目录 ==========
         self.plugin_data_dir = str(StarTools.get_data_dir())
         if not os.path.exists(self.plugin_data_dir):
             os.makedirs(self.plugin_data_dir)
-
-        # ========== 数据迁移 (Legacy -> New) ==========
-        # 旧位置: 插件源码目录 (e.g. data/plugins/astrbot_plugin_telegram_forwarder)
-        legacy_dir = os.path.dirname(__file__)
-        files_to_migrate = [
-            "data.json",
-            "user_session.session",
-            "user_session.session-journal",
-        ]
-
-        for filename in files_to_migrate:
-            src = os.path.join(legacy_dir, filename)
-            dst = os.path.join(self.plugin_data_dir, filename)
-
-            if os.path.exists(src):
-                # 如果目标不存在，或者目标也是空的，才迁移
-                should_migrate = False
-                if not os.path.exists(dst):
-                    should_migrate = True
-                elif (
-                    filename == "data.json" and os.path.getsize(dst) < 100
-                ):  # 可能是空的默认文件
-                    should_migrate = True
-
-                if should_migrate:
-                    try:
-                        shutil.copy2(src, dst)
-                        logger.debug(f"[Migration] 已将 {filename} 从插件目录迁移到数据目录。")
-                    except Exception as e:
-                        logger.error(f"[Migration] 迁移 {filename} 失败: {e}")
 
         # ========== 初始化核心组件 ==========
         self.storage = Storage(os.path.join(self.plugin_data_dir, "data.json"))
@@ -127,51 +97,53 @@ class Main(star.Star):
     async def initialize(self):
         """
         插件启动逻辑
-        
-        执行流程：
-        1. 启动 Telegram 客户端连接
-        2. 如果连接成功且插件已启用，启动定时任务
-        3. 定时任务按照配置的间隔检查频道更新
         """
         # 启动 Telegram 客户端（处理登录、会话恢复等）
-        # 如果配置了 api_id 和 api_hash，尝试启动
         if self.client_wrapper.client:
+            logger.info("正在尝试连接 Telegram 客户端...")
             await self.client_wrapper.start()
-
+        
         # 检查客户端是否成功连接并授权
-        if self.client_wrapper.is_authorized():
+        is_authorized = self.client_wrapper.is_authorized()
+        logger.info(f"Telegram 客户端授权状态: {'已授权' if is_authorized else '未授权'}")
+
+        if is_authorized:
             # ========== 启动定时调度器 ==========
             check_interval = self.config.get("check_interval", 60)
             send_interval = self.config.get("send_interval", 60)
 
             # 任务 1: 检查更新 (Capture)
+            check_start_time = datetime.now() + timedelta(seconds=5)
             self.scheduler.add_job(
                 self.forwarder.check_updates,
                 "interval",
                 seconds=check_interval,
                 max_instances=1,
                 coalesce=True,
-                next_run_time=datetime.now() + timedelta(seconds=5) # 首次抓取稍快执行
+                next_run_time=check_start_time
             )
 
             # 任务 2: 执行发送 (Send)
+            send_start_time = datetime.now() + timedelta(seconds=30)
             self.scheduler.add_job(
                 self.forwarder.send_pending_messages,
                 "interval",
                 seconds=send_interval,
                 max_instances=1,
                 coalesce=True,
-                next_run_time=datetime.now() + timedelta(seconds=60) # 首次发送稍作延迟
+                next_run_time=send_start_time
             )
 
             # 启动调度器
             self.scheduler.start()
 
-            logger.info(f"Telegram Forwarder 已启动。检测间隔: {check_interval}s, 发送间隔: {send_interval}s")
+            logger.info(f"Telegram Forwarder 已成功启动并激活调度器。")
+            logger.info(f" - 抓取任务: 每 {check_interval}s 执行一次 (首次执行: {check_start_time.strftime('%H:%M:%S')})")
+            logger.info(f" - 发送任务: 每 {send_interval}s 执行一次 (首次执行: {send_start_time.strftime('%H:%M:%S')})")
             logger.debug(f"正在监控频道: {self.config.get('source_channels')}")
+        else:
+            logger.error("Telegram 客户端未授权，定时任务未启动。请检查 session 文件或 api_id/api_hash。")
 
-        # 捕获 QQ 平台实例变量初始化 (已在 __init__ 中处理)
-        # self.bot = None
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP | filter.PlatformAdapterType.QQOFFICIAL)
     async def on_qq_message(self, event: AstrMessageEvent):

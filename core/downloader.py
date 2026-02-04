@@ -33,28 +33,23 @@ class MediaDownloader:
                 )
                 return local_files
 
-        is_photo = hasattr(msg, "photo") and msg.photo
-        is_video = False
-        is_audio = False
+        is_photo = bool(msg.photo)
+        is_video = bool(msg.video)
+        is_audio = bool(msg.audio or msg.voice)
+        is_file = bool(msg.file)
 
-        if msg.video:
-            is_video = True
-        
-        if msg.file and msg.file.mime_type:
-            mime = msg.file.mime_type
-            if mime.startswith("audio/") or mime == "application/ogg":
-                is_audio = True
-            elif mime.startswith("video/"):
-                is_video = True
-
-        should_download = is_photo or is_audio or is_video
-
-        if not should_download and msg.file and msg.file.mime_type:
-            if msg.file.mime_type.startswith("image/") or msg.file.mime_type.startswith("video/"):
-                should_download = True
+        should_download = is_photo or is_video or is_audio or is_file
 
         if should_download:
-            media_type = "图片" if is_photo else ("视频" if is_video else "音频")
+            if is_photo:
+                media_type = "图片"
+            elif is_video:
+                media_type = "视频"
+            elif is_audio:
+                media_type = "音频"
+            else:
+                media_type = "文件"
+            
             logger.debug(f"[Downloader] 检测到消息 {msg.id} 中的{media_type}，开始下载...")
             
             def progress_callback(current, total):

@@ -6,20 +6,11 @@ from astrbot.api import logger
 class Storage:
     """
     数据持久化管理类
-
-    负责加载、保存和查询频道的消息ID状态信息。
     """
 
     def __init__(self, data_file: str):
         """
         初始化存储管理器
-
-        Args:
-            data_file: 数据文件路径，通常为 data.json
-
-        行为：
-            - 自动从文件加载已有数据
-            - 如果文件不存在或损坏，使用默认数据
         """
         self.data_file = data_file
         self.persistence = self._load()
@@ -69,7 +60,9 @@ class Storage:
                 "grouped_id": grouped_id
             })
             self.save()
-            logger.debug(f"[Storage] 消息 {msg_id} (组: {grouped_id}) 已保存到 {channel_name} 待发送队列")
+            logger.debug(f"[Storage] 消息 {msg_id} (组: {grouped_id}) 已保存到 {channel_name} 待发送队列。当前队列大小: {len(data['pending_queue'])}")
+        else:
+            logger.debug(f"[Storage] 消息 {msg_id} 已在队列中，跳过。")
 
     def update_pending_queue(self, channel_name: str, queue: list):
         """更新频道的待发送队列"""
@@ -93,6 +86,31 @@ class Storage:
                 })
         return all_pending
 
+    def remove_ids_from_pending(self, channel_name: str, msg_ids: list):
+        """从待发送队列中移除指定 ID 的消息"""
+        data = self.get_channel_data(channel_name)
+        original_len = len(data["pending_queue"])
+        data["pending_queue"] = [m for m in data["pending_queue"] if m["id"] not in msg_ids]
+        if len(data["pending_queue"]) != original_len:
+            self.save()
+            logger.debug(f"[Storage] 从 {channel_name} 队列移除了 {original_len - len(data['pending_queue'])} 条消息")
+
+    def cleanup_expired_pending(self, retention_seconds: int):
+        """清理所有频道中过期的消息"""
+        import time
+        now = time.time()
+        total_cleaned = 0
+        for channel_name, info in self.persistence.get("channels", {}).items():
+            queue = info.get("pending_queue", [])
+            new_queue = [m for m in queue if now - m["time"] <= retention_seconds]
+            if len(new_queue) != len(queue):
+                total_cleaned += (len(queue) - len(new_queue))
+                info["pending_queue"] = new_queue
+        
+        if total_cleaned > 0:
+            self.save()
+            logger.debug(f"[Storage] 全局清理了 {total_cleaned} 条过期消息。")
+        return total_cleaned
     def update_last_id(self, channel_name: str, last_id: int):
         """
         更新频道的最后处理消息ID
