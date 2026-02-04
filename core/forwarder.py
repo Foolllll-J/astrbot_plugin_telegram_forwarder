@@ -112,7 +112,9 @@ class Forwarder:
                     return []
 
                 lock = self._get_channel_lock(channel_name)
-                if lock.locked(): return []
+                if lock.locked(): 
+                    logger.debug(f"[Capture] 频道 {channel_name} 正在抓取中，跳过本次。")
+                    return []
 
                 async with lock:
                     self._channel_last_check[channel_name] = now
@@ -120,7 +122,7 @@ class Forwarder:
                     messages = await self._fetch_channel_messages(channel_name, start_date, msg_limit)
                     
                     if messages:
-                        logger.debug(f"[Capture] 从频道 {channel_name} 捕获到 {len(messages)} 条新消息，准备持久化。")
+                        logger.debug(f"[Capture] 从频道 {channel_name} 捕获到 {len(messages)} 条新消息，已加入待发送队列。")
                         for m in messages:
                             self.storage.add_to_pending_queue(channel_name, m.id, m.date.timestamp(), m.grouped_id)
                     else:
@@ -134,21 +136,20 @@ class Forwarder:
         if tasks:
             await asyncio.gather(*tasks)
 
-        await self.send_pending_messages()
-
     async def send_pending_messages(self):
         """
         从待发送队列中提取消息并执行转发
         """
-        logger.debug("[Send] 正在检测待发送队列...")
+        all_pending = self.storage.get_all_pending()
+        queue_size = len(all_pending) if all_pending else 0
+        logger.info(f"[Send] 正在检测待发送队列... 当前队列大小: {queue_size}")
+        
+        if not all_pending:
+            return
+
         batch_limit = self.config.get("batch_size_limit", 3)
         retention = self.config.get("retention_period", 86400)
         now_ts = datetime.now().timestamp()
-
-        all_pending = self.storage.get_all_pending()
-        if not all_pending:
-            logger.debug("[Send] 待发送队列为空。")
-            return
 
         valid_pending = []
         expired_count = 0
@@ -159,13 +160,16 @@ class Forwarder:
                 expired_count += 1
         
         if expired_count > 0:
-            logger.debug(f"[Send] 自动清理了 {expired_count} 条已过期消息。")
+            logger.info(f"[Send] 自动清理了 {expired_count} 条已过期消息。")
             self._update_storage_queues(valid_pending)
 
         if not valid_pending:
+            logger.info("[Send] 过滤过期消息后，待发送队列为空。")
             return
 
         valid_pending.sort(key=lambda x: x["time"], reverse=True)
+        
+        logger.info(f"[Send] 准备处理 {min(len(valid_pending), batch_limit)} 个逻辑批次 (batch_limit={batch_limit})")
 
         to_send_meta = []
         processed_ids = set()
@@ -277,7 +281,7 @@ class Forwarder:
             self._update_storage_queues(remaining_pending)
             
             if sent_ids:
-                logger.debug(f"[Send] 批次处理完成。队列剩余: {len(remaining_pending)} 条消息。")
+                logger.info(f"[Send] 批次处理完成。已发送 {len(sent_ids)} 条消息，队列剩余: {len(remaining_pending)} 条。")
 
     async def _send_sorted_messages_in_batches(self, batches_with_channel: List[tuple]):
         """发送排好序的消息批次"""

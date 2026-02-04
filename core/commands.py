@@ -91,8 +91,13 @@ class PluginCommands:
 
     async def force_check(self, event: AstrMessageEvent):
         """立即检查更新"""
-        yield event.plain_result("🔄 正在触发立即检查更新...")
-        asyncio.create_task(self.forwarder.check_updates())
+        yield event.plain_result("🔄 正在触发立即检查更新并尝试发送...")
+        
+        async def run_sync():
+            await self.forwarder.check_updates()
+            await self.forwarder.send_pending_messages()
+            
+        asyncio.create_task(run_sync())
 
     async def show_help(self, event: AstrMessageEvent):
         """显示帮助信息"""

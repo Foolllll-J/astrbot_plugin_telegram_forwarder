@@ -141,21 +141,33 @@ class Main(star.Star):
         # 检查客户端是否成功连接并授权
         if self.client_wrapper.is_authorized():
             # ========== 启动定时调度器 ==========
-            # 目前采用一体化 FGSS 模式，只需一个任务即可
-            send_interval = self.config.get("check_interval", 60) # 使用全局检查间隔
+            check_interval = self.config.get("check_interval", 60)
+            send_interval = self.config.get("send_interval", 60)
+
+            # 任务 1: 检查更新 (Capture)
             self.scheduler.add_job(
                 self.forwarder.check_updates,
+                "interval",
+                seconds=check_interval,
+                max_instances=1,
+                coalesce=True,
+                next_run_time=datetime.now() + timedelta(seconds=5) # 首次抓取稍快执行
+            )
+
+            # 任务 2: 执行发送 (Send)
+            self.scheduler.add_job(
+                self.forwarder.send_pending_messages,
                 "interval",
                 seconds=send_interval,
                 max_instances=1,
                 coalesce=True,
-                next_run_time=datetime.now() + timedelta(seconds=60) # 首次执行稍作延迟
+                next_run_time=datetime.now() + timedelta(seconds=60) # 首次发送稍作延迟
             )
 
             # 启动调度器
             self.scheduler.start()
 
-            logger.info(f"Telegram Forwarder 已启动。检查间隔: {send_interval}s")
+            logger.info(f"Telegram Forwarder 已启动。检测间隔: {check_interval}s, 发送间隔: {send_interval}s")
             logger.debug(f"正在监控频道: {self.config.get('source_channels')}")
 
         # 捕获 QQ 平台实例变量初始化 (已在 __init__ 中处理)
