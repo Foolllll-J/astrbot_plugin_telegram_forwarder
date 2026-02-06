@@ -80,6 +80,12 @@
                         "default": 10,
                         "hint": "每次检测最多处理几条消息，建议设为 5~20"
                     },
+                    "priority": {
+                        "type": "int",
+                        "description": "优先级",
+                        "default": 0,
+                        "hint": "数值越大优先级越高，未设置或为 0 时优先级最低，设置值需 >= 1"
+                    },
                     "exclude_text_on_media": {
                         "description": "媒体消息仅发送媒体",
                         "type": "string",
@@ -123,6 +129,7 @@
                 "start_time": "",
                 "check_interval": 0,
                 "msg_limit": 10,
+                "priority": 0,
                 "exclude_text_on_media": "继承全局",
                 "forward_types": ["文字", "图片", "视频", "音频", "文件"],
                 "max_file_size": 0
@@ -189,6 +196,12 @@
                 "hint": "超过此时间的消息在发送前将被丢弃",
                 "type": "int",
                 "default": 86400
+            },
+            "curfew_time": {
+                "description": "宵禁时间段",
+                "hint": "在此时间段内将跳过拉取和转发。格式如 23:00-07:00 (支持跨天)。留空禁用。",
+                "type": "string",
+                "default": ""
             },
             "filter_keywords": {
                 "type": "list",

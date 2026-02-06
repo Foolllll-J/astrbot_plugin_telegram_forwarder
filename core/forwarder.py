@@ -131,21 +131,58 @@ class Forwarder:
         check_interval = channel_cfg.get("check_interval") or global_cfg.get("check_interval", 60)
         send_interval = global_cfg.get("send_interval", 60)
 
+        # 3.5 优先级校验 (小于 1 视作 0)
+        priority = channel_cfg.get("priority", 0)
+        if priority < 1:
+            priority = 0
+
         return {
             "forward_types": forward_types,
             "max_file_size": max_file_size,
             "filter_keywords": filter_keywords,
             "check_interval": check_interval,
             "send_interval": send_interval,
+            "priority": priority,
             "exclude_text_on_media": channel_cfg.get("exclude_text_on_media", "继承全局") == "开启" or 
                                     (channel_cfg.get("exclude_text_on_media", "继承全局") == "继承全局" and global_cfg.get("exclude_text_on_media", False))
         }
+
+    def _is_curfew(self) -> bool:
+        """检查当前是否处于宵禁时间"""
+        forward_cfg = self.config.get("forward_config", {})
+        curfew_time = forward_cfg.get("curfew_time", "").strip()
+        if not curfew_time:
+            return False
+
+        try:
+            # 格式校验 11:11-14:12
+            if "-" not in curfew_time:
+                return False
+            
+            start_str, end_str = curfew_time.split("-")
+            start_time = datetime.strptime(start_str.strip(), "%H:%M").time()
+            end_time = datetime.strptime(end_str.strip(), "%H:%M").time()
+            now_time = datetime.now().time()
+
+            if start_time <= end_time:
+                # 非跨天情况 (例: 11:11-14:12)
+                return start_time <= now_time <= end_time
+            else:
+                # 跨天情况 (例: 23:00-07:00)
+                return now_time >= start_time or now_time <= end_time
+        except Exception as e:
+            logger.error(f"[Forwarder] 宵禁时间格式解析错误: {curfew_time}. 错误: {e}")
+            return False
 
     async def check_updates(self):
         """
         检查所有配置的频道更新并加入待发送队列
         """
         if not self.client_wrapper.is_connected():
+            return
+
+        if self._is_curfew():
+            logger.debug("[Capture] 当前处于宵禁时间，跳过拉取任务。")
             return
 
         channels_config = self.config.get("source_channels", [])
@@ -212,6 +249,10 @@ class Forwarder:
         """
         从待发送队列中提取消息并执行转发
         """
+        if self._is_curfew():
+            logger.debug("[Send] 当前处于宵禁时间，跳过转发任务。")
+            return
+
         all_pending = self.storage.get_all_pending()
         queue_size = len(all_pending) if all_pending else 0
         
@@ -251,7 +292,15 @@ class Forwarder:
         if not valid_pending:
             return
 
-        valid_pending.sort(key=lambda x: x["time"], reverse=True)
+        # 优先级排序逻辑
+        source_channels = self.config.get("source_channels", [])
+        channel_priorities = {
+            cfg.get("channel_username"): self._get_effective_config(cfg.get("channel_username"))["priority"] 
+            for cfg in source_channels if cfg.get("channel_username")
+        }
+        
+        # 排序规则：优先级从大到小 (priority DESC)，如果优先级相同则按时间从大到小 (time DESC，即新消息优先)
+        valid_pending.sort(key=lambda x: (channel_priorities.get(x["channel"], 0), x["time"]), reverse=True)
         
         logger.debug(f"[Send] 开始处理待发送队列 (批次上限: {batch_limit})")
 
