@@ -1,7 +1,7 @@
 import asyncio
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List
 from telethon.tl.types import Message, PeerUser
 
@@ -19,11 +19,6 @@ from .mergers import MessageMerger
 class Forwarder:
     """
     消息转发器核心类 (Monitor + Dispatcher)
-
-    负责：
-    1. 监控源频道更新
-    2. 过滤消息
-    3. 分发给各平台 Sender
     """
 
     def __init__(
@@ -41,6 +36,7 @@ class Forwarder:
         self.client = client_wrapper.client
         self.plugin_data_dir = plugin_data_dir
         self.proxy_url = config.get("proxy")
+        self._stopping = False # 新增停止标志
 
         # 初始化组件
         self.downloader = MediaDownloader(self.client, plugin_data_dir)
@@ -56,6 +52,12 @@ class Forwarder:
 
         # 启动时清理孤儿文件
         self._cleanup_orphaned_files()
+
+        # 启动时重置不在配置中的频道的 last_post_id
+        source_channels = config.get("source_channels", [])
+        active_channels = [c.get("channel_username") for c in source_channels if c.get("channel_username")]
+        logger.debug(f"[Capture] 当前活跃监控频道列表: {active_channels}")
+        self.storage.reset_inactive_channels(active_channels)
 
         # 任务锁，防止重入 (Key: ChannelName)
         self._channel_locks = {}
@@ -131,7 +133,10 @@ class Forwarder:
         check_interval = channel_cfg.get("check_interval") or global_cfg.get("check_interval", 60)
         send_interval = global_cfg.get("send_interval", 60)
 
-        # 3.5 优先级校验 (小于 1 视作 0)
+        # 3.5 查重开关
+        enable_deduplication = global_cfg.get("enable_deduplication", True)
+
+        # 3.6 优先级校验 (小于 1 视作 0)
         priority = channel_cfg.get("priority", 0)
         if priority < 1:
             priority = 0
@@ -142,9 +147,12 @@ class Forwarder:
             "filter_keywords": filter_keywords,
             "check_interval": check_interval,
             "send_interval": send_interval,
+            "enable_deduplication": enable_deduplication,
             "priority": priority,
             "exclude_text_on_media": channel_cfg.get("exclude_text_on_media", "继承全局") == "开启" or 
-                                    (channel_cfg.get("exclude_text_on_media", "继承全局") == "继承全局" and global_cfg.get("exclude_text_on_media", False))
+                                    (channel_cfg.get("exclude_text_on_media", "继承全局") == "继承全局" and global_cfg.get("exclude_text_on_media", False)),
+            "start_time": channel_cfg.get("start_time", ""),
+            "msg_limit": channel_cfg.get("msg_limit", 20)
         }
 
     def _is_curfew(self) -> bool:
@@ -178,6 +186,9 @@ class Forwarder:
         """
         检查所有配置的频道更新并加入待发送队列
         """
+        if self._stopping:
+            return
+
         if not self.client_wrapper.is_connected():
             return
 
@@ -195,20 +206,34 @@ class Forwarder:
                 
                 effective_cfg = self._get_effective_config(channel_name)
                 
-                start_date = None
-                s_time = cfg.get("start_time", "")
-                if s_time:
-                    try:
-                        start_date = datetime.strptime(s_time, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                    except: pass
-                
                 interval = effective_cfg["check_interval"]
-                msg_limit = cfg.get("msg_limit", 20)
+                msg_limit = effective_cfg["msg_limit"]
 
+                # 1. 优先检查抓取间隔，没到时间直接退出，避免无效开销
                 now = datetime.now().timestamp()
                 last_check = self._channel_last_check.get(channel_name, 0)
                 if now - last_check < interval:
                     return []
+
+                # 2. 到时间了，再获取该频道上次拉取的最后一条消息 ID
+                channel_data = self.storage.get_channel_data(channel_name)
+                last_id = channel_data.get("last_post_id", 0)
+
+                start_date = None
+                s_time = effective_cfg.get("start_time", "")
+                # 只有在 last_id 为 0 (说明从未成功拉取过，需要冷启动) 时，才执行日期转换逻辑
+                if last_id == 0 and s_time:
+                    try:
+                        dt_naive = datetime.strptime(s_time, "%Y-%m-%d")
+                        # 设为北京时间 00:00:00 (UTC+8)
+                        tz_beijing = timezone(timedelta(hours=8))
+                        dt_beijing = dt_naive.replace(tzinfo=tz_beijing)
+                        # 转换为 UTC
+                        start_date = dt_beijing.astimezone(timezone.utc)
+                        logger.debug(f"[Capture] 频道 {channel_name} 冷启动日期转换: 输入 {s_time} (北京时间) -> 转换为 UTC: {start_date}")
+                    except Exception as e:
+                        logger.warning(f"[Capture] 频道 {channel_name} 冷启动日期格式错误 '{s_time}': {e}")
+                        pass
 
                 lock = self._get_channel_lock(channel_name)
                 if lock.locked(): 
@@ -223,7 +248,13 @@ class Forwarder:
                     if messages:
                         # 先加入队列，再更新 last_id
                         for m in messages:
-                            self.storage.add_to_pending_queue(channel_name, m.id, m.date.timestamp(), m.grouped_id)
+                            self.storage.add_to_pending_queue(
+                                channel_name, 
+                                m.id, 
+                                m.date.timestamp(), 
+                                m.grouped_id,
+                                is_cold_start=(last_id == 0 and start_date is not None)
+                            )
                         
                         max_id = max(m.id for m in messages)
                         self.storage.update_last_id(channel_name, max_id)
@@ -233,6 +264,12 @@ class Forwarder:
                         logger.debug(f"[Capture] 频道 {channel_name} 无新消息。")
                     return messages
             except Exception as e:
+                error_msg = str(e)
+                if "database disk image is malformed" in error_msg:
+                    logger.error(f"[Capture] Telethon 数据库文件损坏 (malformed)。可尝试重载插件以恢复...")
+                    session_path = os.path.join(self.plugin_data_dir, "user_session")
+                    from .client import TelegramClientWrapper
+                    TelegramClientWrapper.clear_cache(session_path)
                 logger.error(f"[Capture] 检查频道 {cfg} 时出现未捕获异常: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
@@ -249,6 +286,9 @@ class Forwarder:
         """
         从待发送队列中提取消息并执行转发
         """
+        if self._stopping:
+            return
+
         if self._is_curfew():
             logger.debug("[Send] 当前处于宵禁时间，跳过转发任务。")
             return
@@ -279,7 +319,8 @@ class Forwarder:
         valid_pending = []
         expired_count = 0
         for item in all_pending:
-            if now_ts - item["time"] <= retention:
+            # 冷启动消息不检测过期时间
+            if item.get("is_cold_start", False) or (now_ts - item["time"] <= retention):
                 valid_pending.append(item)
             else:
                 expired_count += 1
@@ -299,8 +340,27 @@ class Forwarder:
             for cfg in source_channels if cfg.get("channel_username")
         }
         
-        # 排序规则：优先级从大到小 (priority DESC)，如果优先级相同则按时间从大到小 (time DESC，即新消息优先)
-        valid_pending.sort(key=lambda x: (channel_priorities.get(x["channel"], 0), x["time"]), reverse=True)
+        # 优先级排序逻辑
+        source_channels = self.config.get("source_channels", [])
+        channel_priorities = {
+            cfg.get("channel_username"): self._get_effective_config(cfg.get("channel_username"))["priority"] 
+            for cfg in source_channels if cfg.get("channel_username")
+        }
+        
+        # 排序规则：
+        # 1. 优先级 (priority) 从大到小 (reverse=True)
+        # 2. 消息类型标识：如果是冷启动产生的补旧消息，按时间正序（旧->新）；如果是日常新消息，按时间倒序（新->旧）
+        # 3. 实时消息优先于补旧消息
+        def sorting_key(x):
+            prio = channel_priorities.get(x["channel"], 0)
+            is_cold = x.get("is_cold_start", False)
+            # 元组排序维度：
+            # (优先级 DESC, 是否冷启动 ASC (False先排), 时间)
+            # 如果是实时消息 (is_cold=False): 时间降序 (-time)
+            # 如果是冷启动消息 (is_cold=True): 时间升序 (time)
+            return (-prio, is_cold, -x["time"] if not is_cold else x["time"])
+
+        valid_pending.sort(key=sorting_key)
         
         logger.debug(f"[Send] 开始处理待发送队列 (批次上限: {batch_limit})")
 
@@ -444,6 +504,12 @@ class Forwarder:
                             if meta and meta.get("grouped_id"):
                                 skipped_grouped_ids.add((channel, meta["grouped_id"]))
                 except Exception as e:
+                    error_msg = str(e)
+                    if "database disk image is malformed" in error_msg:
+                        logger.error(f"[Send] Telethon 数据库文件损坏 (malformed)。可尝试重载插件以恢复...")
+                        session_path = os.path.join(self.plugin_data_dir, "user_session")
+                        from .client import TelegramClientWrapper
+                        TelegramClientWrapper.clear_cache(session_path)
                     logger.error(f"[Send] 拉取消息失败 {channel}: {e}")
 
             # 3. 应用过滤并构建本轮有效的 batches
@@ -525,6 +591,10 @@ class Forwarder:
                 # 2. 转发到 Telegram
                 await self.tg_sender.send([msgs], display_name, effective_cfg)
 
+    def stop(self):
+        """停止转发器工作"""
+        self._stopping = True
+
     async def _fetch_channel_messages(
         self, channel_name: str, start_date: Optional[datetime], msg_limit: int = 20
     ) -> List[Message]:
@@ -538,36 +608,75 @@ class Forwarder:
         logger.debug(f"[Fetch] 频道: {channel_name} | 记录的最新 ID (last_id): {last_id}")
 
         try:
+            effective_cfg = self._get_effective_config(channel_name)
+            enable_dedup = effective_cfg.get("enable_deduplication", True)
+
+            # 0. 获取频道实体并记录 ID (用于查重)
+            entity = await self.client.get_input_entity(channel_name)
+            if hasattr(entity, "channel_id"):
+                self.storage.update_channel_id(channel_name, entity.channel_id)
+            
+            new_messages = []
+            
+            # 1. 如果没有上次拉取的 ID
             if last_id == 0:
                 if start_date:
-                    logger.info(f"[Fetch] {channel_name}: 冷启动 -> {start_date}")
-                    pass
+                    # 执行冷启动：从指定日期开始向后抓取
+                    params = {
+                        "entity": channel_name,
+                        "reverse": True, 
+                        "offset_date": start_date,
+                        "limit": 1000 # 冷启动设置安全上限
+                    }
+                    logger.info(f"[Fetch] {channel_name}: 首次运行，执行冷启动，从 {start_date.strftime('%Y-%m-%d')} 开始拉取历史消息")
                 else:
+                    # 无冷启动设置：初始化 last_id 为最新消息 ID，不搬运旧消息
                     msgs = await self.client.get_messages(channel_name, limit=1)
                     if msgs:
                         self.storage.update_last_id(channel_name, msgs[0].id)
-                        logger.info(f"[Fetch] {channel_name}: 初始化 ID -> {msgs[0].id}")
+                        logger.info(f"[Fetch] {channel_name}: 首次运行且无冷启动设置，初始化 ID -> {msgs[0].id}")
                     return []
-
-            new_messages = []
-            params = {"entity": channel_name, "reverse": True, "limit": msg_limit}
-
-            if last_id > 0:
-                params["min_id"] = last_id
-                logger.debug(f"[Fetch] {channel_name}: 拉取 ID > {last_id}")
-            elif start_date:
-                params["offset_date"] = start_date
             else:
-                params["limit"] = 5
+                # 2. 正常增量抓取
+                params = {
+                    "entity": channel_name,
+                    "reverse": True,
+                    "min_id": last_id,
+                    "limit": msg_limit
+                }
+                logger.debug(f"[Fetch] {channel_name}: 增量拉取，ID > {last_id}")
 
             async for message in self.client.iter_messages(**params):
                 if not message.id:
                     continue
+                
+                # --- 转发查重逻辑 ---
+                if enable_dedup and message.fwd_from and message.fwd_from.from_id:
+                    from telethon.tl.types import PeerChannel
+                    if isinstance(message.fwd_from.from_id, PeerChannel):
+                        src_channel_id = message.fwd_from.from_id.channel_id
+                        orig_msg_id = message.fwd_from.channel_post
+                        
+                        # 查找该 ID 是否对应我们正在监控的某个频道
+                        src_channel_name = self.storage.get_channel_name_by_id(src_channel_id)
+                        if src_channel_name:
+                            # 检查原消息是否已经处理过 (通过比较原频道的 last_post_id)
+                            src_data = self.storage.get_channel_data(src_channel_name)
+                            src_last_id = src_data.get("last_post_id", 0)
+                            
+                            if orig_msg_id <= src_last_id:
+                                logger.debug(f"[Fetch] 频道 {channel_name} 的消息 {message.id} 是转发自监控频道 {src_channel_name} 的旧消息 (原 ID: {orig_msg_id} <= 已处理 ID: {src_last_id})，自动跳过。")
+                                continue
+                # ------------------
+
                 new_messages.append(message)
 
             return new_messages
 
         except Exception as e:
+            error_msg = str(e)
+            if "database disk image is malformed" in error_msg:
+                logger.error(f"[Fetch] Telethon 数据库文件损坏 (malformed)。建议重载插件。")
             logger.error(f"[Fetch] {channel_name}: 访问失败 - {e}")
             return []
 

@@ -42,22 +42,42 @@ class Storage:
         if channel_name not in self.persistence["channels"]:
             self.persistence["channels"][channel_name] = {
                 "last_post_id": 0,
+                "channel_id": None, # 记录频道的数字 ID，用于转发查重
                 "pending_queue": []
             }
         
         if "pending_queue" not in self.persistence["channels"][channel_name]:
             self.persistence["channels"][channel_name]["pending_queue"] = []
             
+        if "channel_id" not in self.persistence["channels"][channel_name]:
+            self.persistence["channels"][channel_name]["channel_id"] = None
+            
         return self.persistence["channels"][channel_name]
 
-    def add_to_pending_queue(self, channel_name: str, msg_id: int, timestamp: float, grouped_id: int = None):
+    def update_channel_id(self, channel_name: str, channel_id: int):
+        """更新频道的数字 ID"""
+        data = self.get_channel_data(channel_name)
+        if data.get("channel_id") != channel_id:
+            data["channel_id"] = channel_id
+            self.save()
+            logger.debug(f"[Storage] 更新频道 {channel_name} 的数字 ID 为 {channel_id}")
+
+    def get_channel_name_by_id(self, channel_id: int) -> str:
+        """根据数字 ID 获取频道名"""
+        for name, info in self.persistence.get("channels", {}).items():
+            if info.get("channel_id") == channel_id:
+                return name
+        return None
+
+    def add_to_pending_queue(self, channel_name: str, msg_id: int, timestamp: float, grouped_id: int = None, is_cold_start: bool = False):
         """添加单条消息到待发送队列"""
         data = self.get_channel_data(channel_name)
         if not any(m["id"] == msg_id for m in data["pending_queue"]):
             data["pending_queue"].append({
                 "id": msg_id, 
                 "time": timestamp,
-                "grouped_id": grouped_id
+                "grouped_id": grouped_id,
+                "is_cold_start": is_cold_start
             })
             self.save()
             logger.debug(f"[Storage] 消息 {msg_id} (组: {grouped_id}) 已保存到 {channel_name} 待发送队列。当前队列大小: {len(data['pending_queue'])}")
@@ -82,7 +102,8 @@ class Storage:
                     "channel": channel_name,
                     "id": msg["id"],
                     "time": msg["time"],
-                    "grouped_id": msg.get("grouped_id")
+                    "grouped_id": msg.get("grouped_id"),
+                    "is_cold_start": msg.get("is_cold_start", False)
                 })
         return all_pending
 
@@ -99,18 +120,35 @@ class Storage:
         """清理所有频道中过期的消息"""
         import time
         now = time.time()
-        total_cleaned = 0
+        cleaned_total = 0
         for channel_name, info in self.persistence.get("channels", {}).items():
-            queue = info.get("pending_queue", [])
-            new_queue = [m for m in queue if now - m["time"] <= retention_seconds]
-            if len(new_queue) != len(queue):
-                total_cleaned += (len(queue) - len(new_queue))
+            old_queue = info.get("pending_queue", [])
+            # 冷启动消息不参与过期清理
+            new_queue = [m for m in old_queue if m.get("is_cold_start", False) or (now - m["time"] <= retention_seconds)]
+            if len(new_queue) != len(old_queue):
+                cleaned_total += (len(old_queue) - len(new_queue))
                 info["pending_queue"] = new_queue
         
-        if total_cleaned > 0:
+        if cleaned_total > 0:
             self.save()
-            logger.debug(f"[Storage] 全局清理了 {total_cleaned} 条过期消息。")
-        return total_cleaned
+            logger.debug(f"[Storage] 全局清理了 {cleaned_total} 条过期消息。")
+        return cleaned_total
+
+    def reset_inactive_channels(self, active_channels: list):
+        """
+        将不在 active_channels 列表中的频道的 last_post_id 清零。
+        这确保了如果将来重新启用这些频道，冷启动逻辑能正确触发。
+        """
+        changed = False
+        for channel_name, info in self.persistence.get("channels", {}).items():
+            if channel_name not in active_channels:
+                if info.get("last_post_id", 0) != 0:
+                    info["last_post_id"] = 0
+                    logger.info(f"[Storage] 频道 {channel_name} 当前未被监控，已重置其 last_post_id 为 0")
+                    changed = True
+        
+        if changed:
+            self.save()
     def update_last_id(self, channel_name: str, last_id: int):
         """
         更新频道的最后处理消息ID

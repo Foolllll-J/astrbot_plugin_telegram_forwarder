@@ -2,7 +2,7 @@
     "napcat_api_url": {
         "description": "NapCat API 地址",
         "type": "string",
-        "hint": "NapCat 的 HTTP API 地址。若设为 localhost，则使用 AstrBot 内部接口发送（推荐）。",
+        "hint": "NapCat 的 HTTP API 地址。若设为 localhost，则使用框架内部接口发送",
         "default": "localhost"
     },
     "target_qq_group": {
@@ -49,7 +49,7 @@
         "file_types": [
             "session"
         ],
-        "hint": "上传 .session 文件以直接登录，避免验证码问题，你可以使用本地脚本生成此文件后上传"
+        "hint": "上传 .session 文件以直接登录，避免验证码或人机验证问题，你可以使用本地脚本生成此文件后上传"
     },
     "source_channels": {
         "description": "源频道配置列表",
@@ -147,7 +147,13 @@
                 "type": "bool",
                 "default": true,
                 "description": "显示频道标题",
-                "hint": "开启时，From 头部将显示频道名称而非 ID。程序会自动获取频道标题。"
+                "hint": "开启时，From 头部将显示频道名称而非 ID"
+            },
+            "enable_deduplication": {
+                "type": "bool",
+                "default": true,
+                "description": "转发查重",
+                "hint": "开启时，如果频道 A 转发了频道 B 的消息，且频道 B 也在监控列表中，则频道 A 的这条转发消息将被自动跳过，避免重复发送"
             },
             "exclude_text_on_media": {
                 "description": "媒体消息仅发送媒体",

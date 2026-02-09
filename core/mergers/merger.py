@@ -24,7 +24,7 @@ class MessageMerger:
         self.config = config
         self.merge_rules = self._load_merge_rules()
         logger.info(
-            f"[Merge] Initialized with {len(self.merge_rules)} rules: {list(self.merge_rules.keys())}"
+            f"[Merge] 合并引擎已启动，加载了 {len(self.merge_rules)} 条规则: {list(self.merge_rules.keys())}"
         )
 
     def _load_merge_rules(self) -> Dict[str, MergeRule]:
@@ -43,18 +43,18 @@ class MessageMerger:
             params = rule_config.get("params", {})
 
             if not channel or not rule_class_name:
-                logger.warning(f"[Merge] Invalid merge rule config: {rule_config}")
+                logger.warning(f"[Merge] 无效的合并规则配置: {rule_config}")
                 continue
 
             if rule_class_name not in self.RULE_CLASSES:
-                logger.warning(f"[Merge] Unknown rule class: {rule_class_name}")
+                logger.warning(f"[Merge] 未知的规则类: {rule_class_name}")
                 continue
 
             rule_class = self.RULE_CLASSES[rule_class_name]
             merge_rules[channel] = rule_class(params)
 
             logger.info(
-                f"[Merge] Loaded rule '{rule_class_name}' for channel '{channel}'"
+                f"[Merge] 已加载频道 '{channel}' 的合并规则 '{rule_class_name}'"
             )
 
         return merge_rules
@@ -72,11 +72,11 @@ class MessageMerger:
             合并后的消息列表（可能添加了 _merge_group_id 标记）
         """
         if not self.merge_rules:
-            logger.info("[Merge] No merge rules configured")
+            logger.debug("[Merge] 未配置合并规则，跳过处理。")
             return messages
 
         logger.debug(
-            f"[Merge] Processing {len(messages)} messages, rules: {list(self.merge_rules.keys())}"
+            f"[Merge] 正在处理 {len(messages)} 条消息，生效规则: {list(self.merge_rules.keys())}"
         )
 
         merged_messages = []
@@ -96,7 +96,7 @@ class MessageMerger:
                 continue
 
             logger.debug(
-                f"[Merge] Found rule for channel '{channel_name}', checking message {i}"
+                f"[Merge] 发现频道 '{channel_name}' 的合并规则，正在检查消息 {i}"
             )
 
             # 尝试查找可合并的消息
@@ -112,7 +112,7 @@ class MessageMerger:
                 if group_key:
                     rule.apply_merge_marker(group_msgs, group_key)
                     logger.debug(
-                        f"[Merge] Merged group for channel '{channel_name}' with {len(group_msgs)} messages, key={group_key}"
+                        f"[Merge] 已合并频道 '{channel_name}' 的 {len(group_msgs)} 条消息，分组键: {group_key}"
                     )
 
                 merged_messages.extend(group_msgs)
@@ -124,7 +124,7 @@ class MessageMerger:
                 used_indices.add(i)
 
         logger.info(
-            f"[Merge] Before: {len(messages)} messages, After: {len(merged_messages)} messages"
+            f"[Merge] 消息合并完成: 处理前 {len(messages)} 条 -> 处理后 {len(merged_messages)} 条"
         )
 
         return merged_messages

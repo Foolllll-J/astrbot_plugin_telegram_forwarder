@@ -29,20 +29,20 @@ class SomeACGPreviewPlusOriginal(MergeRule):
         # 检查 msg1 是否是预览图说明
         if not self._is_preview_message(message1):
             logger.debug(
-                f"[SomeACG] msg1 is not preview (id={message1.id}): "
-                f"has_media={bool(message1.media)}, "
-                f"is_photo={isinstance(message1.media, MessageMediaPhoto) if message1.media else False}, "
-                f"has_text={bool(message1.text)}, "
-                f"text_content={message1.text[:100] if message1.text else 'N/A'}"
+                f"[SomeACG] 消息 1 不是预览图 (ID={message1.id}): "
+                f"有媒体={bool(message1.media)}, "
+                f"是照片={isinstance(message1.media, MessageMediaPhoto) if message1.media else False}, "
+                f"有文本={bool(message1.text)}, "
+                f"文本预览={message1.text[:100] if message1.text else '无'}"
             )
             return False
 
         # 检查 msg2 是否是原图
         if not self._is_original_message(message2):
             logger.debug(
-                f"[SomeACG] msg2 is not original (id={message2.id}): "
-                f"has_media={bool(message2.media)}, "
-                f"has_text={bool(message2.text)}"
+                f"[SomeACG] 消息 2 不是原图 (ID={message2.id}): "
+                f"有媒体={bool(message2.media)}, "
+                f"有文本={bool(message2.text)}"
             )
             return False
 
@@ -50,7 +50,7 @@ class SomeACGPreviewPlusOriginal(MergeRule):
         pixiv_id1 = self._extract_pixiv_id(message1.text)
         if not pixiv_id1:
             logger.debug(
-                f"[SomeACG] Cannot extract pixiv_id from msg1 (id={message1.id}), text: {message1.text[:200]}"
+                f"[SomeACG] 无法从消息 1 (ID={message1.id}) 提取 Pixiv ID, 文本: {message1.text[:200]}"
             )
             return False
 
@@ -60,7 +60,7 @@ class SomeACGPreviewPlusOriginal(MergeRule):
 
         if not is_document_original:
             logger.debug(
-                f"[SomeACG] Unknown media type for original: {type(message2.media).__name__}"
+                f"[SomeACG] 未知的原图媒体类型: {type(message2.media).__name__}"
             )
             return False
 
@@ -73,18 +73,18 @@ class SomeACGPreviewPlusOriginal(MergeRule):
         if is_audio_original:
             # 音频类型：SomeACG 的原图通常是音频，不需要文件名匹配
             logger.debug(
-                f"[SomeACG] Audio original (msg{message2.id}), skipping filename check"
+                f"[SomeACG] 音频原图 (消息 ID={message2.id}), 跳过文件名匹配。"
             )
         else:
             # 文档类型：检查文件名匹配 pixiv ID
             pixiv_id2 = self._extract_pixiv_id_from_filename(message2)
             logger.debug(
-                f"[SomeACG] Document original, pixiv_id1={pixiv_id1}, pixiv_id2={pixiv_id2}"
+                f"[SomeACG] 文档原图, 消息1 PixivID={pixiv_id1}, 消息2 PixivID={pixiv_id2}"
             )
 
             if not self._file_name_contains_pixiv_id(message2, pixiv_id1):
                 logger.debug(
-                    f"[SomeACG] pixiv_id mismatch: msg1={pixiv_id1}, msg2={pixiv_id2}"
+                    f"[SomeACG] Pixiv ID 不匹配: 消息1={pixiv_id1}, 消息2={pixiv_id2}"
                 )
                 return False
 
@@ -94,7 +94,7 @@ class SomeACGPreviewPlusOriginal(MergeRule):
 
         if time_diff < 0 or time_diff > time_window:
             logger.debug(
-                f"[SomeACG] Time window exceeded: {time_diff}s > {time_window}s"
+                f"[SomeACG] 超出时间窗口: {time_diff}s > {time_window}s"
             )
             return False
 

@@ -16,11 +16,7 @@ from .core.commands import PluginCommands
 
 
 class Main(star.Star):
-    """
-    Telegram 转发插件主类
-
-    继承自 AstrBot 的 star.Star 基类，实现插件的生命周期管理。
-    """
+    """Telegram 转发插件主类"""
 
     def __init__(self, context: star.Context, config: AstrBotConfig) -> None:
         """
@@ -142,7 +138,9 @@ class Main(star.Star):
             logger.info(f"Telegram Forwarder 已成功启动并激活调度器。")
             logger.info(f" - 抓取任务: 每 {check_interval}s 执行一次 (首次执行: {check_start_time.strftime('%H:%M:%S')})")
             logger.info(f" - 发送任务: 每 {send_interval}s 执行一次 (首次执行: {send_start_time.strftime('%H:%M:%S')})")
-            logger.debug(f"正在监控频道: {self.config.get('source_channels')}")
+            source_channels = self.config.get('source_channels', [])
+            channel_names = [c.get('channel_username') for c in source_channels if c.get('channel_username')]
+            logger.info(f"正在监控频道: {', '.join(channel_names) if channel_names else '无'}")
         else:
             logger.error("Telegram 客户端未授权，定时任务未启动。请检查 session 文件或 api_id/api_hash。")
 
@@ -167,6 +165,10 @@ class Main(star.Star):
         """插件终止时的清理工作"""
         logger.debug("[Main] 正在停止插件...")
 
+        # 0. 停止转发器逻辑
+        if hasattr(self, "forwarder"):
+            self.forwarder.stop()
+
         # 1. Stop Scheduler
         if self.scheduler.running:
             logger.debug("[Main] 正在关闭调度器...")
@@ -174,24 +176,23 @@ class Main(star.Star):
             logger.debug("[Main] 调度器已关闭。")
 
         # 2. Client Disconnect Strategy
-        force_disconnect = self.config.get("force_disconnect", False)
-
-        if self.client_wrapper.client:
-            if force_disconnect:
-                logger.debug("[Main] 正在强制断开客户端连接...")
-                try:
-                    await asyncio.wait_for(
-                        self.client_wrapper.client.disconnect(), timeout=1.0
-                    )
-                    logger.debug("[Main] 客户端已断开连接。")
-                    from .core.client import TelegramClientWrapper
-                    TelegramClientWrapper.clear_cache()
-                except asyncio.TimeoutError:
-                    logger.warning("[Main] 断开客户端连接超时")
-                except Exception as e:
-                    logger.error(f"[Main] 断开客户端连接时出错: {e}")
-            else:
-                logger.debug("[Main] 保持客户端连接以便快速重载")
+        if self.client_wrapper and self.client_wrapper.client:
+            session_path = os.path.join(self.plugin_data_dir, "user_session")
+            logger.debug(f"[Main] 正在安全断开客户端连接: {session_path}")
+            try:
+                # 稍微增加等待时间至 5 秒，确保 SQLite 事务安全提交
+                await asyncio.wait_for(
+                    self.client_wrapper.client.disconnect(), timeout=5.0
+                )
+                logger.debug("[Main] 客户端已安全断开连接。")
+            except asyncio.TimeoutError:
+                logger.warning("[Main] 安全断开客户端连接超时，强制清理缓存。")
+            except Exception as e:
+                logger.debug(f"[Main] 断开连接时遇到异常 (通常不影响下次启动): {e}")
+            finally:
+                # 无论是否成功断开，都清理缓存，确保下次加载时重新初始化
+                from .core.client import TelegramClientWrapper
+                TelegramClientWrapper.clear_cache(session_path)
 
         logger.info("Telegram Forwarder 已停止")
 
