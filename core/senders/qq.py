@@ -38,26 +38,29 @@ class QQSender:
         self.platform_id = None  # 动态捕获的平台 ID
         self.bot = None  # 动态捕获的 bot 实例
         self.node_name = None  # 合并转发消息时显示的 bot 昵称
+        self._cached_self_id = None  # 缓存 bot 的 user_id
 
-    async def _ensure_node_name(self, bot, cache_fallback: bool = False):
-        """获取 bot 昵称"""
+    async def _ensure_node_name(self, bot, cache_fallback: bool = False) -> tuple[str, int]:
+        """获取 bot 昵称和 user_id，返回 (node_name, self_id)"""
         if self.node_name and self.node_name != "AstrBot":
-            return self.node_name
+            return (self.node_name, self._cached_self_id or 0)
 
         try:
-            # 优先从登录信息获取
             info = await bot.get_login_info()
-            if info and (nickname := info.get("nickname")):
-                self.node_name = str(nickname)
-                logger.debug(f"[QQSender] 获取到 bot 昵称: {self.node_name}")
+            if info:
+                if nickname := info.get("nickname"):
+                    self.node_name = str(nickname)
+                    logger.debug(f"[QQSender] 获取到 bot 昵称: {self.node_name}")
+                self._cached_self_id = info.get("user_id", 0)
+                logger.debug(f"[QQSender] 获取到 bot user_id: {self._cached_self_id}")
             else:
                 logger.debug(f"[QQSender] 未能从登录信息获取到昵称")
         except Exception as e:
-            logger.debug(f"[QQSender] 获取 bot 昵称异常: {e}")
+            logger.debug(f"[QQSender] 获取 bot 信息异常: {e}")
 
         if cache_fallback and not self.node_name:
             self.node_name = "AstrBot"
-        return self.node_name
+        return (self.node_name, self._cached_self_id or 0)
 
     def _get_lock(self, group_id):
         if group_id not in self._group_locks:
@@ -316,18 +319,11 @@ class QQSender:
             if bot and not self.bot:
                 self.bot = bot
 
-            self_id = 0
-            node_name = (
+            node_name, self_id = (
                 await self._ensure_node_name(bot, cache_fallback=True)
                 if bot
-                else "AstrBot"
+                else ("AstrBot", 0)
             )
-            if bot:
-                try:
-                    info = await bot.get_login_info()
-                    self_id = info.get("user_id", 0)
-                except Exception as e:
-                    logger.error(f"[QQSender] 获取 bot 详细信息失败: {e}")
 
             # ─── 判断是否为混合频道大合并模式 ───
             is_mixed_big_merge = bool(involved_channels and len(involved_channels) > 1)
