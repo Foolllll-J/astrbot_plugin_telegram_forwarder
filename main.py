@@ -18,6 +18,8 @@ from .core.commands import PluginCommands
 class Main(star.Star):
     """Telegram 转发插件主类"""
 
+    STARTUP_GRACE_SECONDS = 30
+
     def __init__(self, context: star.Context, config: AstrBotConfig) -> None:
         """
         插件初始化
@@ -26,6 +28,7 @@ class Main(star.Star):
         self.context = context
         self.config = config
         self.bot = None
+        self._runtime_bootstrap_task = None
 
 
         # ========== 设置数据目录 ==========
@@ -80,7 +83,7 @@ class Main(star.Star):
         self.scheduler = AsyncIOScheduler()
 
         # 初始化命令处理器
-        self.command_handler = PluginCommands(context, config, self.forwarder)
+        self.command_handler = PluginCommands(context, config, self.forwarder, self.scheduler)
 
         # ========== 配置检查警告 ==========
         if not self.config.get("api_id") or not self.config.get("api_hash"):
@@ -94,7 +97,7 @@ class Main(star.Star):
         """
         # 启动 Telegram 客户端（处理登录、会话恢复等）
         if self.client_wrapper.client:
-            logger.info("正在尝试连接 Telegram 客户端...")
+            logger.debug("正在尝试连接 Telegram 客户端...")
             await self.client_wrapper.start()
         
         # 检查客户端是否成功连接并授权
@@ -102,6 +105,18 @@ class Main(star.Star):
         logger.info(f"Telegram 客户端授权状态: {'已授权' if is_authorized else '未授权'}")
 
         if is_authorized:
+            startup_grace = self.STARTUP_GRACE_SECONDS
+
+            if hasattr(self.forwarder, "qq_sender"):
+                async def _bootstrap_runtime_later():
+                    await asyncio.sleep(startup_grace)
+                    try:
+                        await self.forwarder.qq_sender.initialize_runtime()
+                    except Exception as e:
+                        logger.debug(f"[Main] QQ sender runtime delayed bootstrap failed: {e}")
+
+                self._runtime_bootstrap_task = asyncio.create_task(_bootstrap_runtime_later())
+
             # ========== 启动定时调度器 ==========
             # 从全局 forward_config 对象中获取间隔
             forward_config = self.config.get("forward_config", {})
@@ -109,7 +124,7 @@ class Main(star.Star):
             send_interval = forward_config.get("send_interval", 60)
 
             # 任务 1: 检查更新 (Capture)
-            check_start_time = datetime.now() + timedelta(seconds=5)
+            check_start_time = datetime.now() + timedelta(seconds=startup_grace)
             self.scheduler.add_job(
                 self.forwarder.check_updates,
                 "interval",
@@ -120,7 +135,7 @@ class Main(star.Star):
             )
 
             # 任务 2: 执行发送 (Send)
-            send_start_time = datetime.now() + timedelta(seconds=30)
+            send_start_time = datetime.now() + timedelta(seconds=startup_grace + 5)
             self.scheduler.add_job(
                 self.forwarder.send_pending_messages,
                 "interval",
@@ -143,25 +158,17 @@ class Main(star.Star):
             logger.error("Telegram 客户端未授权，定时任务未启动。请检查 session 文件或 api_id/api_hash。")
 
 
-    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP | filter.PlatformAdapterType.QQOFFICIAL)
-    async def on_qq_message(self, event: AstrMessageEvent):
-        """通过接收到的消息动态捕获并确认 QQ 平台 ID"""
-        umo = event.unified_msg_origin
-        if ":" in umo:
-            platform_id = umo.split(":")[0]
-            if not self.bot or getattr(self.forwarder.qq_sender, "platform_id", None) != platform_id:
-                self.bot = event.bot
-                if hasattr(self, "forwarder") and hasattr(self.forwarder, "qq_sender"):
-                    self.forwarder.qq_sender.platform_id = platform_id
-                    self.forwarder.qq_sender.bot = event.bot
-                logger.debug(f"通过消息事件成功捕获/更新 QQ platform_id: {platform_id}")
-                
-                if hasattr(self.forwarder.qq_sender, "_ensure_node_name"):
-                    asyncio.create_task(self.forwarder.qq_sender._ensure_node_name(event.bot))
-
     async def terminate(self):
         """插件终止时的清理工作"""
         logger.debug("[Main] 正在停止插件...")
+
+        # 取消延迟初始化任务
+        if self._runtime_bootstrap_task and not self._runtime_bootstrap_task.done():
+            self._runtime_bootstrap_task.cancel()
+            try:
+                await self._runtime_bootstrap_task
+            except asyncio.CancelledError:
+                pass
 
         # 0. 停止转发器逻辑
         if hasattr(self, "forwarder"):
@@ -170,8 +177,14 @@ class Main(star.Star):
         # 1. Stop Scheduler
         if self.scheduler.running:
             logger.debug("[Main] 正在关闭调度器...")
+            self.scheduler.pause()
             self.scheduler.shutdown(wait=False)
             logger.debug("[Main] 调度器已关闭。")
+        if hasattr(self, "forwarder"):
+            try:
+                await self.forwarder.shutdown(timeout=10.0)
+            except Exception as e:
+                logger.warning(f"[Main] 等待 Forwarder 关闭时遇到异常: {e}")
 
         # 2. Client Disconnect Strategy
         if self.client_wrapper and self.client_wrapper.client:
@@ -179,9 +192,7 @@ class Main(star.Star):
             logger.debug(f"[Main] 正在安全断开客户端连接: {session_path}")
             try:
                 # 稍微增加等待时间至 5 秒，确保 SQLite 事务安全提交
-                await asyncio.wait_for(
-                    self.client_wrapper.client.disconnect(), timeout=5.0
-                )
+                await self.client_wrapper.disconnect(timeout=5.0)
                 logger.debug("[Main] 客户端已安全断开连接。")
             except asyncio.TimeoutError:
                 logger.warning("[Main] 安全断开客户端连接超时，强制清理缓存。")
@@ -190,43 +201,111 @@ class Main(star.Star):
             finally:
                 # 无论是否成功断开，都清理缓存，确保下次加载时重新初始化
                 from .core.client import TelegramClientWrapper
-                TelegramClientWrapper.clear_cache(session_path)
+                await TelegramClientWrapper.disconnect_and_clear_cache(session_path)
 
         logger.info("Telegram Forwarder 已停止")
 
-    # ================= COMMANDS =================
+# ================= COMMANDS =================
 
-    @filter.command_group("tg")
-    def tg(self):
-        """Telegram Forwarder 插件管理"""
-        pass
+@filter.command_group("tg")
+@filter.permission_type(filter.PermissionType.ADMIN)
+def tg(self):
+    """Telegram Forwarder 插件管理"""
+    pass
 
-    @tg.command("add")
-    async def add_channel(self, event: AstrMessageEvent, channel: str):
-        """添加监控频道: /tg add <channel>"""
-        async for result in self.command_handler.add_channel(event, channel):
-            yield result
+@tg.command("add")
+async def add_channel(self, event: AstrMessageEvent, channel: str):
+    """添加监控频道"""
+    async for result in self.command_handler.add_channel(event, channel):
+        yield result
 
-    @tg.command("rm")
-    async def remove_channel(self, event: AstrMessageEvent, channel: str):
-        """移除监控频道: /tg rm <channel>"""
-        async for result in self.command_handler.remove_channel(event, channel):
-            yield result
+@tg.command("rm")
+async def remove_channel(self, event: AstrMessageEvent, channel: str):
+    """移除监控频道"""
+    async for result in self.command_handler.remove_channel(event, channel):
+        yield result
 
-    @tg.command("ls")
-    async def list_channels(self, event: AstrMessageEvent):
-        """列出所有监控频道: /tg ls"""
-        async for result in self.command_handler.list_channels(event):
-            yield result
+@tg.command("ls")
+async def list_channels(self, event: AstrMessageEvent):
+    """列出当前监控频道"""
+    async for result in self.command_handler.list_channels(event):
+        yield result
 
-    @tg.command("check")
-    async def force_check(self, event: AstrMessageEvent):
-        """立即检查更新: /tg check"""
-        async for result in self.command_handler.force_check(event):
-            yield result
+@tg.command("check")
+async def force_check(self, event: AstrMessageEvent):
+    """立即触发一次抓取和发送"""
+    async for result in self.command_handler.force_check(event):
+        yield result
 
-    @tg.command("help")
-    async def show_help(self, event: AstrMessageEvent):
-        """显示帮助信息"""
-        async for result in self.command_handler.show_help(event):
-            yield result
+@tg.command("status")
+async def status(self, event: AstrMessageEvent):
+    """查看插件运行状态"""
+    async for result in self.command_handler.show_status(event):
+        yield result
+
+@tg.command("pause")
+async def pause(self, event: AstrMessageEvent):
+    """暂停抓取与发送任务"""
+    async for result in self.command_handler.pause(event):
+        yield result
+
+@tg.command("resume")
+async def resume(self, event: AstrMessageEvent):
+    """恢复抓取与发送任务"""
+    async for result in self.command_handler.resume(event):
+        yield result
+
+@tg.command("queue")
+async def queue(self, event: AstrMessageEvent):
+    """查看待发送队列"""
+    async for result in self.command_handler.show_queue(event):
+        yield result
+
+@tg.command("clearqueue")
+async def clearqueue(self, event: AstrMessageEvent, target: str = None):
+    """清空待发送队列"""
+    async for result in self.command_handler.clear_queue(event, target):
+        yield result
+
+@tg.command("get")
+async def get(self, event: AstrMessageEvent, target: str = ""):
+    """查看频道配置"""
+    async for result in self.command_handler.get_config(event, target):
+        yield result
+
+@tg.command("set")
+async def set_config(self, event: AstrMessageEvent, args: str = ""):
+    """修改频道配置"""
+    full_text = event.message_str.strip()
+    prefix_variants = ["/tg set", "tg set"]
+    cmd_text = full_text
+    for p in prefix_variants:
+        if full_text.lower().startswith(p):
+            cmd_text = full_text[len(p):].strip()
+            break
+
+    parts = cmd_text
+    async for result in self.command_handler.set_config(event, parts):
+        yield result
+
+
+@tg.command("login")
+async def login(self, event: AstrMessageEvent, args: str = ""):
+    """通过 bot 执行 Telegram 登录流程"""
+    full_text = event.message_str.strip()
+    prefix_variants = ["/tg login", "tg login"]
+    cmd_text = full_text
+    for p in prefix_variants:
+        if full_text.lower().startswith(p):
+            cmd_text = full_text[len(p):].strip()
+            break
+
+    async for result in self.command_handler.handle_login(event, cmd_text):
+        yield result
+
+
+@tg.command("help")
+async def show_help(self, event: AstrMessageEvent):
+    """显示插件命令帮助"""
+    async for result in self.command_handler.show_help(event):
+        yield result

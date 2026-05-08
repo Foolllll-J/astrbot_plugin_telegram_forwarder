@@ -1,15 +1,9 @@
 {
-    "napcat_api_url": {
-        "description": "NapCat API 地址",
-        "type": "string",
-        "hint": "NapCat 的 HTTP API 地址。通常保持默认 localhost，使用框架内部接口发送",
-        "default": "localhost"
-    },
-    "target_qq_group": {
-        "description": "QQ 目标群号",
+    "target_qq_session": {
+        "description": "QQ 目标会话列表",
         "type": "list",
-        "item_type": "int",
-        "hint": "转发到 QQ 群列表",
+        "item_type": "string",
+        "hint": "转发到 QQ 会话列表（支持群号，或完整会话名，例如 平台ID:GroupMessage:群号 / 平台ID:FriendMessage:用户ID）",
         "default": []
     },
     "target_channel": {
@@ -89,7 +83,11 @@
                     "exclude_text_on_media": {
                         "description": "媒体消息仅发送媒体",
                         "type": "string",
-                        "options": ["继承全局", "开启", "关闭"],
+                        "options": [
+                            "继承全局",
+                            "开启",
+                            "关闭"
+                        ],
                         "default": "继承全局",
                         "hint": "开启时，若消息包含媒体则不发送文本；选择‘继承全局’则使用全局配置"
                     },
@@ -97,14 +95,32 @@
                         "description": "转发消息类型",
                         "type": "list",
                         "hint": "选择需要搬运的消息类型，全不选表示不搬运任何消息",
-                        "options": ["文字", "图片", "视频", "音频", "文件"],
-                        "default": ["文字", "图片", "视频", "音频", "文件"]
+                        "options": [
+                            "文字",
+                            "图片",
+                            "视频",
+                            "音频",
+                            "文件"
+                        ],
+                        "default": [
+                            "文字",
+                            "图片",
+                            "视频",
+                            "音频",
+                            "文件"
+                        ]
                     },
                     "max_file_size": {
                         "description": "文件大小限制 (MB)",
                         "type": "float",
                         "default": 0,
                         "hint": "除图片外的媒体大小限制，0 表示不限制"
+                    },
+                    "ignore_global_filters": {
+                        "description": "忽略全局文本过滤",
+                        "type": "bool",
+                        "default": false,
+                        "hint": "开启后，该频道将忽略全局的过滤规则（但仍执行本频道自己的过滤规则）。常用于白名单式频道或重要通知频道。"
                     },
                     "filter_keywords": {
                         "type": "list",
@@ -122,9 +138,24 @@
                     "filter_spoiler_messages": {
                         "description": "过滤遮罩/剧透消息",
                         "type": "string",
-                        "options": ["继承全局", "开启", "关闭"],
+                        "options": [
+                            "继承全局",
+                            "开启",
+                            "关闭"
+                        ],
                         "default": "继承全局",
                         "hint": "开启后，带有 Telegram 剧透标记（文本或媒体）的消息将被跳过"
+                    },
+                    "strip_markdown_links": {
+                        "description": "剥离 Markdown 链接，只保留文本",
+                        "type": "string",
+                        "options": [
+                            "继承全局",
+                            "开启",
+                            "关闭"
+                        ],
+                        "default": "继承全局",
+                        "hint": "开启后该频道 [文本](链接) 只保留文本"
                     },
                     "monitor_keywords": {
                         "type": "list",
@@ -138,6 +169,13 @@
                         "description": "监听正则",
                         "default": "",
                         "hint": "命中后会立即触发转发"
+                    },
+                    "target_qq_sessions": {
+                        "description": "该频道专属 QQ 目标会话列表",
+                        "type": "list",
+                        "item_type": "string",
+                        "default": [],
+                        "hint": "填写则覆盖全局 QQ 目标会话（支持群号或完整会话名） 留空使用全局配置"
                     }
                 }
             }
@@ -152,7 +190,13 @@
                 "priority": 0,
                 "exclude_text_on_media": "继承全局",
                 "filter_spoiler_messages": "继承全局",
-                "forward_types": ["文字", "图片", "视频", "音频", "文件"],
+                "forward_types": [
+                    "文字",
+                    "图片",
+                    "视频",
+                    "音频",
+                    "文件"
+                ],
                 "max_file_size": 0,
                 "monitor_keywords": [],
                 "monitor_regex": ""
@@ -166,6 +210,23 @@
         "description": "全局转发配置",
         "hint": "配置全局转发配置与过滤规则",
         "items": {
+            "qq_merge_threshold": {
+                "description": "QQ 大合并",
+                "type": "int",
+                "default": 0,
+                "hint": "本次要发的消息数 ≥ 此值时，全部打包成一条合并转发消息。设为 ≤1 则永不触发大合并。推荐 5~10。注意：此值必须 ≤「单次发送消息批次上限」，否则永远不会触发"
+            },
+            "qq_big_merge_mode": {
+                "description": "QQ 大合并的聚合范围",
+                "type": "string",
+                "options": [
+                    "独立频道",
+                    "混合所有频道",
+                    "关闭"
+                ],
+                "default": "独立频道",
+                "hint": "『独立频道』：每个频道独立判断是否合并（推荐）；『混合所有频道』：所有频道消息总数达标才合并成一条超大转发；『关闭』强制不使用大合并"
+            },
             "use_channel_title": {
                 "type": "bool",
                 "default": true,
@@ -190,12 +251,30 @@
                 "default": false,
                 "hint": "开启后，带有 Telegram 剧透标记（文本或媒体）的消息将被跳过"
             },
+            "strip_markdown_links": {
+                "description": "剥离 Markdown 链接，只保留文本",
+                "type": "bool",
+                "default": false,
+                "hint": "开启后，[文本](链接) 只保留「文本」，链接部分被完全丢弃"
+            },
             "forward_types": {
                 "description": "转发消息类型",
                 "type": "list",
                 "hint": "选择需要搬运的消息类型，全不选表示不搬运任何消息",
-                "options": ["文字", "图片", "视频", "音频", "文件"],
-                "default": ["文字", "图片", "视频", "音频", "文件"]
+                "options": [
+                    "文字",
+                    "图片",
+                    "视频",
+                    "音频",
+                    "文件"
+                ],
+                "default": [
+                    "文字",
+                    "图片",
+                    "视频",
+                    "音频",
+                    "文件"
+                ]
             },
             "max_file_size": {
                 "description": "文件大小限制 (MB)",
@@ -217,7 +296,7 @@
             },
             "batch_size_limit": {
                 "description": "单次发送消息批次上限",
-                "hint": "每批次发送时单次消息数量上限",
+                "hint": "每批次发送时单次消息数量上限。此值必须 ≥「QQ 大合并」阈值，否则大合并永远不会触发。推荐 10",
                 "type": "int",
                 "slider": {
                     "min": 1,

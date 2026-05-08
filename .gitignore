@@ -1,6 +1,11 @@
 config.json
+config.json.bak
+*.bak
 data.json
 __pycache__/
 *.pyc
 user_session.session*
 *.session-journal
+.omc
+.claude
+CLAUDE.md

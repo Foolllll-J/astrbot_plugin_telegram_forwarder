@@ -40,7 +40,65 @@ class TelegramClientWrapper:
         self.config = config
         self.plugin_data_dir = plugin_data_dir
         self.client = None
+        self._authorized = False
         self._init_client()
+
+    def _session_path(self) -> str:
+        return os.path.join(self.plugin_data_dir, "user_session")
+
+    async def ensure_connected(self) -> bool:
+        if not self.client:
+            return False
+        if self.client.is_connected():
+            return True
+        await self.client.connect()
+        return self.client.is_connected()
+
+    async def disconnect(self, timeout: float = 5.0) -> None:
+        """Safely disconnect the current Telethon client."""
+        if not self.client or not self.client.is_connected():
+            return
+        await asyncio.wait_for(self.client.disconnect(), timeout=timeout)
+
+    async def send_login_code(self, phone: str) -> str:
+        """发送登录验证码并返回 phone_code_hash。"""
+        if not await self.ensure_connected():
+            raise RuntimeError("Telegram 客户端未初始化，请先设置 api_id/api_hash")
+        sent = await asyncio.wait_for(self.client.send_code_request(phone), timeout=30.0)
+        return getattr(sent, "phone_code_hash", "")
+
+    async def sign_in_with_code(self, phone: str, code: str, phone_code_hash: str = ""):
+        """Use login code to sign in. Returns (ok, False); 2FA is signaled via SessionPasswordNeededError."""
+        if not await self.ensure_connected():
+            raise RuntimeError("Telegram 客户端未初始化，请先设置 api_id/api_hash")
+        if phone_code_hash:
+            await self.client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+        else:
+            await self.client.sign_in(phone=phone, code=code)
+        return await self._mark_authorized_if_needed()
+
+    async def sign_in_with_password(self, password: str) -> bool:
+        """提交两步验证密码。"""
+        if not await self.ensure_connected():
+            raise RuntimeError("Telegram 客户端未初始化，请先设置 api_id/api_hash")
+        await self.client.sign_in(password=password)
+        ok, _ = await self._mark_authorized_if_needed()
+        return ok
+
+    async def _mark_authorized_if_needed(self):
+        authorized = await self.client.is_user_authorized()
+        if authorized:
+            self._authorized = True
+            auth_cache = get_auth_cache()
+            auth_cache[self._session_path()] = True
+            # 某些会话（例如 bot 会话）可能无权限调用 get_dialogs，
+            # 此时不应影响“已授权”状态判定。
+            try:
+                await self.client.get_dialogs(limit=None)
+            except Exception as e:
+                logger.debug(f"[Client] skip get_dialogs after auth: {e}")
+            return True, False
+        return False, False
 
     def _init_client(self):
         """
@@ -70,7 +128,7 @@ class TelegramClientWrapper:
         if api_id and api_hash:
             # 会话文件路径：存储登录状态和缓存
             # 使用 .session 扩展名，Telethon 会自动添加
-            session_path = os.path.join(self.plugin_data_dir, "user_session")
+            session_path = self._session_path()
 
             # ========== 检查缓存 ==========
             cache = get_client_cache()
@@ -150,7 +208,7 @@ class TelegramClientWrapper:
             # ========== 快速路径：检查是否已连接并授权 ==========
             # 如果客户端是从缓存复用的，且已经连接并授权，直接返回
             if self.client.is_connected():
-                session_path = os.path.join(self.plugin_data_dir, "user_session")
+                session_path = self._session_path()
                 auth_cache = get_auth_cache()
 
                 if auth_cache.get(session_path, False):
@@ -194,7 +252,7 @@ class TelegramClientWrapper:
             logger.info("[Client] Telegram 客户端授权成功！")
             self._authorized = True
 
-            session_path = os.path.join(self.plugin_data_dir, "user_session")
+            session_path = self._session_path()
             auth_cache = get_auth_cache()
             auth_cache[session_path] = True
 
@@ -232,3 +290,21 @@ class TelegramClientWrapper:
             logger.debug(f"[Client Cache] 清理所有缓存 ({client_count} 个会话)")
             cache.clear()
             auth_cache.clear()
+
+    @staticmethod
+    async def disconnect_and_clear_cache(
+        session_path: str, timeout: float = 5.0
+    ) -> None:
+        """Disconnect any cached client for a session and then clear caches."""
+        cache = get_client_cache()
+        cached_client = cache.get(session_path)
+
+        try:
+            if cached_client and cached_client.is_connected():
+                await asyncio.wait_for(cached_client.disconnect(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"[Client Cache] 断开缓存客户端超时: {session_path}")
+        except Exception as e:
+            logger.debug(f"[Client Cache] 断开缓存客户端失败 {session_path}: {e}")
+        finally:
+            TelegramClientWrapper.clear_cache(session_path)
