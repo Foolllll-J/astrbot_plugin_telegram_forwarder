@@ -29,6 +29,8 @@ class TelegramClientWrapper:
     负责创建和管理 Telethon 客户端实例。
     """
 
+    DEFAULT_CONNECT_TIMEOUT_SECONDS = 30.0
+
     def __init__(self, config: AstrBotConfig, plugin_data_dir: str):
         """
         初始化客户端封装
@@ -41,18 +43,48 @@ class TelegramClientWrapper:
         self.plugin_data_dir = plugin_data_dir
         self.client = None
         self._authorized = False
+        self.connect_timeout_seconds = self._load_connect_timeout_seconds()
         self._init_client()
 
     def _session_path(self) -> str:
         return os.path.join(self.plugin_data_dir, "user_session")
+
+    def _load_connect_timeout_seconds(self) -> float:
+        raw_timeout = self.config.get(
+            "connect_timeout_seconds",
+            self.DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        )
+        try:
+            timeout = float(raw_timeout)
+        except (TypeError, ValueError):
+            timeout = self.DEFAULT_CONNECT_TIMEOUT_SECONDS
+        return max(timeout, 0.1)
+
+    async def _connect_with_timeout(self) -> bool:
+        if not self.client:
+            return False
+        try:
+            await asyncio.wait_for(
+                self.client.connect(),
+                timeout=self.connect_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[Client] Telegram connect timed out after "
+                f"{self.connect_timeout_seconds:.1f}s"
+            )
+            return False
+        except Exception as e:
+            logger.error(f"[Client] Telegram connect failed: {e}")
+            return False
+        return self.client.is_connected()
 
     async def ensure_connected(self) -> bool:
         if not self.client:
             return False
         if self.client.is_connected():
             return True
-        await self.client.connect()
-        return self.client.is_connected()
+        return await self._connect_with_timeout()
 
     async def disconnect(self, timeout: float = 5.0) -> None:
         """Safely disconnect the current Telethon client."""
@@ -165,7 +197,7 @@ class TelegramClientWrapper:
                 api_id,
                 api_hash,
                 proxy=proxy_setting,
-                connection_retries=None,
+                connection_retries=0,
                 retry_delay=5,
                 auto_reconnect=True,
             )
@@ -179,7 +211,7 @@ class TelegramClientWrapper:
                 "Telegram Forwarder: 缺少 api_id 或 api_hash，请在配置中填写。"
             )
 
-    async def start(self):
+    async def start(self) -> bool:
         """
         启动 Telegram 客户端
 
@@ -202,7 +234,7 @@ class TelegramClientWrapper:
         """
         # 客户端未初始化时直接返回
         if not self.client:
-            return
+            return False
 
         try:
             # ========== 快速路径：检查是否已连接并授权 ==========
@@ -214,17 +246,19 @@ class TelegramClientWrapper:
                 if auth_cache.get(session_path, False):
                     self._authorized = True
                     logger.debug(f"[Client Cache] 复用已授权的客户端: {session_path}")
-                    return
+                    return True
                 else:
                     authorized = await self.client.is_user_authorized()
                     if authorized:
                         auth_cache[session_path] = True
                         self._authorized = True
                         logger.debug(f"[Client Cache] 复用已授权的客户端: {session_path}")
-                        return
+                        return True
 
             # ========== 慢速路径：完整初始化 ==========
-            await self.client.connect()
+            if not await self._connect_with_timeout():
+                self._authorized = False
+                return False
 
             # ========== 检查授权状态 ==========
             authorized = await self.client.is_user_authorized()
@@ -240,13 +274,13 @@ class TelegramClientWrapper:
                         )
                     except asyncio.TimeoutError:
                         logger.error("[Client] 发送验证码请求超时")
-                        return
+                        return False
 
                     logger.error("[Client] Telegram 客户端需要验证！请在交互式终端运行一次以完成登录。")
-                    return
+                    return False
                 else:
                     logger.error("[Client] 未提供手机号，无法登录。")
-                    return
+                    return False
 
             # ========== 授权成功 ==========
             logger.info("[Client] Telegram 客户端授权成功！")
@@ -260,10 +294,12 @@ class TelegramClientWrapper:
             logger.debug("[Client] 正在同步对话框...")
             await self.client.get_dialogs(limit=None)
             logger.debug("[Client] 对话框同步完成")
+            return True
 
         except Exception as e:
             logger.error(f"[Client] Telegram 客户端错误: {e}")
             self._authorized = False
+            return False
 
     def is_connected(self):
         """检查客户端连接状态"""

@@ -98,7 +98,9 @@ class Main(star.Star):
         # 启动 Telegram 客户端（处理登录、会话恢复等）
         if self.client_wrapper.client:
             logger.debug("正在尝试连接 Telegram 客户端...")
-            await self.client_wrapper.start()
+            started = await self.client_wrapper.start()
+            if not started:
+                logger.warning("Telegram 客户端启动失败或超时，插件将以未连接状态继续加载。")
         
         # 检查客户端是否成功连接并授权
         is_authorized = self.client_wrapper.is_authorized()
