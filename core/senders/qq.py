@@ -83,6 +83,22 @@ class QQSender:
             pass
         return fpath
 
+    @staticmethod
+    def _message_has_media(msg: Message) -> bool:
+        """Return whether the original Telegram message contains sendable media."""
+        return bool(
+            getattr(msg, "media", None)
+            and (
+                getattr(msg, "photo", None)
+                or getattr(msg, "video", None)
+                or getattr(msg, "audio", None)
+                or getattr(msg, "voice", None)
+                or getattr(msg, "file", None)
+                or getattr(msg, "document", None)
+                or getattr(getattr(msg, "media", None), "document", None)
+            )
+        )
+
     async def initialize_runtime(self):
         """Best-effort bootstrap for platform_id/bot before first forward."""
         await self._bootstrap_qq_runtime()
@@ -362,6 +378,7 @@ class QQSender:
                     for i, msg in enumerate(msgs):
                         current_node_components = []
                         text_parts = []
+                        message_has_media = self._message_has_media(msg)
                         if msg.text:
                             cleaned = clean_telegram_text(
                                 msg.text, strip_links=strip_links
@@ -406,8 +423,15 @@ class QQSender:
                                 )
 
                         should_exclude_text = (
-                            exclude_text_on_media and has_any_attachment
+                            exclude_text_on_media and message_has_media
                         )
+
+                        if should_exclude_text and not media_components:
+                            logger.warning(
+                                "[QQSender] 消息 %s 原始为媒体消息，但未构建出可发送媒体；已根据“媒体消息仅发送媒体”配置跳过纯文本降级发送",
+                                getattr(msg, "id", "unknown"),
+                            )
+                            continue
 
                         # ─── 决定是否添加 From 头部 ───
                         add_header_this_time = False
@@ -590,5 +614,5 @@ class QQSender:
             if os.path.exists(f):
                 try:
                     os.remove(f)
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(f"[QQSender] 清理文件失败 {f}: {e}")

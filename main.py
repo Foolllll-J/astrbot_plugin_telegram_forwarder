@@ -172,7 +172,7 @@ class Main(star.Star):
             except asyncio.CancelledError:
                 pass
 
-        # 0. 停止转发器逻辑
+        # 0. 停止转发器逻辑（会清理内部缓存）
         if hasattr(self, "forwarder"):
             self.forwarder.stop()
 
@@ -204,6 +204,10 @@ class Main(star.Star):
                 # 无论是否成功断开，都清理缓存，确保下次加载时重新初始化
                 from .core.client import TelegramClientWrapper
                 await TelegramClientWrapper.disconnect_and_clear_cache(session_path)
+
+        # 3. 清理全局缓存中的断开连接（防止内存泄漏）
+        from .core.client import TelegramClientWrapper
+        TelegramClientWrapper.cleanup_disconnected_cache()
 
         logger.info("Telegram Forwarder 已停止")
 

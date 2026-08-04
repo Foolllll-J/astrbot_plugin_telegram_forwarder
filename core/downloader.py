@@ -67,31 +67,69 @@ class MediaDownloader:
 
             retry_count = 3
             for attempt in range(retry_count):
+                download_task = None
                 try:
                     if not self.client.is_connected():
                         logger.warning(
                             f"[Downloader] 下载过程中客户端断开 (尝试 {attempt+1})，正在尝试重连..."
                         )
                         try:
-                            await self.client.connect()
+                            await asyncio.wait_for(
+                                self.client.connect(), timeout=30.0
+                            )
+                        except asyncio.TimeoutError:
+                            logger.error(
+                                f"[Downloader] 重连超时 (30s)，放弃重连。"
+                            )
+                            continue
                         except Exception as e:
                             logger.error(f"[Downloader] 重连失败: {e}")
 
-                    path = await self.client.download_media(
-                        msg,
-                        file=self.plugin_data_dir,
-                        progress_callback=progress_callback,
+                    # 创建下载任务
+                    download_task = asyncio.create_task(
+                        self.client.download_media(
+                            msg,
+                            file=self.plugin_data_dir,
+                            progress_callback=progress_callback,
+                        )
                     )
+
+                    try:
+                        path = await asyncio.wait_for(download_task, timeout=120.0)
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"[Downloader] 消息 {msg.id} 下载超时 (120s)，正在取消任务..."
+                        )
+                        # 显式取消任务，防止资源泄漏
+                        download_task.cancel()
+                        try:
+                            await download_task
+                        except asyncio.CancelledError:
+                            pass
+                        continue
+
                     if path:
                         local_files.append(path)
                         break
                 except asyncio.CancelledError:
                     logger.warning(f"[Downloader] 消息 {msg.id} 的下载被取消")
+                    if download_task and not download_task.done():
+                        download_task.cancel()
+                        try:
+                            await download_task
+                        except asyncio.CancelledError:
+                            pass
                     return local_files
                 except Exception as e:
                     logger.warning(
                         f"[Downloader] 消息 {msg.id} 下载失败 (尝试 {attempt+1}/{retry_count}): {e}"
                     )
+                    if download_task and not download_task.done():
+                        download_task.cancel()
+                        try:
+                            await download_task
+                        except asyncio.CancelledError:
+                            pass
                     if attempt < retry_count - 1:
                         await asyncio.sleep(2)
                     else:

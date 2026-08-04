@@ -1,5 +1,6 @@
-from telethon import TelegramClient
+﻿from telethon import TelegramClient
 import sys
+import gc
 import socks
 from astrbot.api import logger, AstrBotConfig
 import asyncio
@@ -88,9 +89,22 @@ class TelegramClientWrapper:
 
     async def disconnect(self, timeout: float = 5.0) -> None:
         """Safely disconnect the current Telethon client."""
-        if not self.client or not self.client.is_connected():
+        if not self.client:
             return
-        await asyncio.wait_for(self.client.disconnect(), timeout=timeout)
+
+        try:
+            # 先断开网络连接
+            if self.client.is_connected():
+                await asyncio.wait_for(self.client.disconnect(), timeout=timeout)
+
+            # 强制关闭 SQLite session，释放文件锁
+            if hasattr(self.client, 'session') and hasattr(self.client.session, 'close'):
+                self.client.session.close()
+                logger.debug("[Client] 已关闭 SQLite session 连接")
+        except asyncio.TimeoutError:
+            logger.warning(f"[Client] disconnect 超时 ({timeout}s)")
+        except Exception as e:
+            logger.debug(f"[Client] disconnect 异常: {e}")
 
     async def send_login_code(self, phone: str) -> str:
         """发送登录验证码并返回 phone_code_hash。"""
@@ -124,9 +138,13 @@ class TelegramClientWrapper:
             auth_cache = get_auth_cache()
             auth_cache[self._session_path()] = True
             # 某些会话（例如 bot 会话）可能无权限调用 get_dialogs，
-            # 此时不应影响“已授权”状态判定。
+            # 此时不应影响”已授权”状态判定。
+            # 注意：只同步少量对话，避免大账号内存暴涨
             try:
-                await self.client.get_dialogs(limit=None)
+                await asyncio.wait_for(
+                    self.client.get_dialogs(limit=10),
+                    timeout=30.0,
+                )
             except Exception as e:
                 logger.debug(f"[Client] skip get_dialogs after auth: {e}")
             return True, False
@@ -164,7 +182,7 @@ class TelegramClientWrapper:
 
             # ========== 检查缓存 ==========
             cache = get_client_cache()
-            
+
             # 尝试从缓存中获取已连接的客户端
             if session_path in cache:
                 cached_client = cache[session_path]
@@ -174,7 +192,19 @@ class TelegramClientWrapper:
                     return
                 else:
                     logger.debug(f"[Client Cache] 缓存的客户端已断开，正在重新创建: {session_path}")
+                    # 强制关闭旧客户端的 SQLite session，释放文件锁
+                    if cached_client and hasattr(cached_client, 'session') and hasattr(cached_client.session, 'close'):
+                        try:
+                            cached_client.session.close()
+                            logger.debug(f"[Client Cache] 已关闭旧客户端的 SQLite session: {session_path}")
+                        except Exception as e:
+                            logger.debug(f"[Client Cache] 关闭 SQLite session 失败: {e}")
                     del cache[session_path]
+
+                    # 等待 SQLite 文件锁完全释放 (防止 "database is locked")
+                    import time
+                    time.sleep(0.5)
+                    logger.debug(f"[Client Cache] 已等待 SQLite 文件锁释放")
 
             # ========== 代理配置解析 ==========
             proxy_url = self.config.get("proxy", "")
@@ -291,8 +321,12 @@ class TelegramClientWrapper:
             auth_cache[session_path] = True
 
             # ========== 同步对话框 ==========
+            # 注意：只同步少量对话，避免大账号内存暴涨（limit=None 会加载所有对话，可能数百MB）
             logger.debug("[Client] 正在同步对话框...")
-            await self.client.get_dialogs(limit=None)
+            try:
+                await asyncio.wait_for(self.client.get_dialogs(limit=10), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.warning("[Client] 对话框同步超时，可能影响频道解析，但尝试继续。")
             logger.debug("[Client] 对话框同步完成")
             return True
 
@@ -318,14 +352,142 @@ class TelegramClientWrapper:
         if session_path:
             if session_path in cache:
                 logger.debug(f"[Client Cache] 清理会话缓存: {session_path}")
+                # 强制关闭 SQLite session，释放文件锁
+                cached_client = cache[session_path]
+                if cached_client and hasattr(cached_client, 'session') and hasattr(cached_client.session, 'close'):
+                    try:
+                        cached_client.session.close()
+                        logger.debug(f"[Client Cache] 清理缓存时已关闭 SQLite session: {session_path}")
+                    except Exception as e:
+                        logger.debug(f"[Client Cache] 清理缓存时关闭 SQLite session 失败: {e}")
                 del cache[session_path]
             if session_path in auth_cache:
                 del auth_cache[session_path]
         else:
             client_count = len(cache)
             logger.debug(f"[Client Cache] 清理所有缓存 ({client_count} 个会话)")
+            # 关闭所有 SQLite session
+            for path, client in list(cache.items()):
+                if client and hasattr(client, 'session') and hasattr(client.session, 'close'):
+                    try:
+                        client.session.close()
+                    except Exception:
+                        pass
             cache.clear()
             auth_cache.clear()
+
+    @staticmethod
+    def cleanup_disconnected_cache():
+        """清理全局缓存中所有已断开的客户端，防止内存泄漏"""
+        cache = get_client_cache()
+        auth_cache = get_auth_cache()
+        disconnected_sessions = []
+
+        for session_path, client in list(cache.items()):
+            if client is None or not client.is_connected():
+                disconnected_sessions.append(session_path)
+
+        for session_path in disconnected_sessions:
+            del cache[session_path]
+            if session_path in auth_cache:
+                del auth_cache[session_path]
+
+        if disconnected_sessions:
+            logger.debug(
+                f"[Client Cache] 清理了 {len(disconnected_sessions)} 个断开的缓存客户端"
+            )
+
+    async def force_reconnect(self) -> bool:
+        """
+        强制断开当前客户端，清理缓存，并创建全新的连接。
+
+        处理场景：Telegram 连接假死（zombie connection），此时 is_connected()
+        仍返回 True 但实际请求无法完成，导致超时循环。
+
+        流程:
+        1. 断开旧客户端（可能已假死）
+        2. 清理所有缓存（sys 全局缓存 + 授权缓存）
+        3. 重置状态，创建新的 TelegramClient 实例
+        4. 连接并验证授权
+        5. **不**同步完整对话列表（避免大账号内存暴涨）
+
+        Returns:
+            True 表示重连成功，False 表示失败
+        """
+        session_path = self._session_path()
+        logger.warning(
+            f"[Client] 正在强制重连 Telegram 客户端 (session: {session_path})..."
+        )
+
+        # 1. 断开旧客户端（忽略超时/异常，尽力断开）
+        old_client = self.client
+        if old_client:
+            try:
+                await asyncio.wait_for(
+                    old_client.disconnect(), timeout=15.0
+                )
+                logger.debug("[Client] 旧客户端已断开")
+            except asyncio.TimeoutError:
+                logger.warning("[Client] 断开旧客户端超时，强制清理。")
+            except Exception as e:
+                logger.debug(f"[Client] 断开旧客户端异常 (可忽略): {e}")
+            finally:
+                # 确保旧客户端的 SQLite session 关闭，释放文件锁及内存
+                try:
+                    if hasattr(old_client, 'session') and old_client.session:
+                        old_client.session.close()
+                except Exception:
+                    pass
+                del old_client
+
+        # 2. 清理所有缓存 (sys 模块全局缓存)
+        TelegramClientWrapper.clear_cache(session_path)
+
+        # 3. 重置 wrapper 状态，断开引用链
+        self.client = None
+        self._authorized = False
+
+        # 4. 主动触发 GC，回收旧 client 及内部循环引用
+        gc.collect()
+
+        # 5. 重新初始化（创建全新的 TelegramClient）
+        self._init_client()
+
+        if not self.client:
+            logger.error("[Client] 强制重连: 创建新客户端失败。")
+            return False
+
+        # 6. 连接新客户端
+        if not await self._connect_with_timeout():
+            logger.error("[Client] 强制重连: 新客户端连接失败。")
+            return False
+
+        # 7. 验证授权
+        try:
+            authorized = await self.client.is_user_authorized()
+            if not authorized:
+                logger.error(
+                    "[Client] 强制重连: 客户端未授权，需要重新登录。"
+                )
+                self._authorized = False
+                return False
+
+            self._authorized = True
+            auth_cache = get_auth_cache()
+            auth_cache[session_path] = True
+
+            # ⚠️ 关键修复：不同步完整对话框列表
+            # 原因：limit=None 会加载所有群组/频道/私聊，大账号可能数百MB甚至1GB+
+            # 代理不稳定时频繁重连会导致内存在几分钟内爆炸式增长
+            # Telethon 会在实际使用时按需解析实体，不需要预加载
+            logger.debug("[Client] 强制重连成功，跳过对话框同步（按需解析实体）")
+
+            logger.info("[Client] 强制重连成功！已创建新客户端连接。")
+            return True
+        except Exception as e:
+            logger.error(f"[Client] 强制重连后授权检查失败: {e}")
+            self._authorized = False
+            return False
 
     @staticmethod
     async def disconnect_and_clear_cache(
@@ -336,8 +498,15 @@ class TelegramClientWrapper:
         cached_client = cache.get(session_path)
 
         try:
-            if cached_client and cached_client.is_connected():
-                await asyncio.wait_for(cached_client.disconnect(), timeout=timeout)
+            if cached_client:
+                # 断开网络连接
+                if cached_client.is_connected():
+                    await asyncio.wait_for(cached_client.disconnect(), timeout=timeout)
+
+                # 强制关闭 SQLite session，释放文件锁
+                if hasattr(cached_client, 'session') and hasattr(cached_client.session, 'close'):
+                    cached_client.session.close()
+                    logger.debug(f"[Client Cache] 已关闭 SQLite session 连接: {session_path}")
         except asyncio.TimeoutError:
             logger.warning(f"[Client Cache] 断开缓存客户端超时: {session_path}")
         except Exception as e:

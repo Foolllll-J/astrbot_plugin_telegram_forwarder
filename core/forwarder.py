@@ -84,8 +84,13 @@ class Forwarder:
         self._shutdown_complete = asyncio.Event()
         self._shutdown_complete.set()
 
-        # 缓存频道标题 (Key: ChannelUsername, Value: Title)
+        # 重连守卫：防止同一周期内多个并发重连
+        self._reconnecting_lock = asyncio.Lock()
+        self._reconnecting = False
+
+        # 缓存频道标题 (Key: ChannelUsername, Value: Title) - 限制大小防止内存泄漏
         self._channel_titles_cache = {}
+        self._channel_titles_cache_max_size = 100
 
     def _get_channel_lock(self, channel_name: str) -> asyncio.Lock:
         if channel_name not in self._channel_locks:
@@ -132,6 +137,22 @@ class Forwarder:
             logger.error(f"[Forwarder] reconnect failed: {e}")
             return False
 
+    async def _safe_force_reconnect(self, caller_hint: str = ""):
+        """安全地执行强制重连，带全局锁防止并发"""
+        async with self._reconnecting_lock:
+            if self._reconnecting:
+                return
+            self._reconnecting = True
+            try:
+                logger.info(f"[Forwarder] 触发强制重连 (原因: {caller_hint})")
+                await self.client_wrapper.force_reconnect()
+                self._sync_client_refs()
+                logger.info(f"[Forwarder] 强制重连完成 (原因: {caller_hint})")
+            except Exception as e:
+                logger.exception(f"[Forwarder] 强制重连异常 ({caller_hint}): {e}")
+            finally:
+                self._reconnecting = False
+
     async def _get_display_name(self, channel_name: str) -> str:
         """获取频道显示名称"""
         forward_cfg = self.config.get("forward_config", {})
@@ -150,8 +171,20 @@ class Forwarder:
 
         # 尝试从 Telegram 获取
         try:
-            entity = await self.client.get_entity(to_telethon_entity(channel_name))
+            entity = await asyncio.wait_for(
+                self.client.get_entity(to_telethon_entity(channel_name)),
+                timeout=15.0,
+            )
             title = getattr(entity, "title", channel_name)
+
+            # LRU 缓存：超过限制时删除最旧的一半
+            if len(self._channel_titles_cache) >= self._channel_titles_cache_max_size:
+                # 删除一半旧条目
+                items_to_remove = list(self._channel_titles_cache.keys())[:self._channel_titles_cache_max_size // 2]
+                for key in items_to_remove:
+                    del self._channel_titles_cache[key]
+                logger.debug(f"[Cache] 清理频道标题缓存，移除 {len(items_to_remove)} 条旧记录")
+
             self._channel_titles_cache[channel_name] = title
             return title
         except Exception as e:
@@ -416,140 +449,158 @@ class Forwarder:
             logger.debug("[Capture] 当前处于宵禁时间，跳过拉取任务。")
             return
 
+        # 定期清理断开的全局客户端缓存（每次检查时执行一次）
+        try:
+            from .client import TelegramClientWrapper
+            TelegramClientWrapper.cleanup_disconnected_cache()
+        except Exception:
+            pass
+
         channels_config = self.config.get("source_channels", [])
+        forward_cfg = self.config.get("forward_config", {})
+        default_check_interval = forward_cfg.get("check_interval", 60)
+        fetch_timeout = max(default_check_interval * 0.8, 15.0)  # 80% 的 check_interval 作为抓取超时上限
         logger.debug(
-            f"[Capture] 开始检查 Telegram 频道更新 (共 {len(channels_config)} 个频道)..."
+            f"[Capture] 开始检查 Telegram 频道更新 (共 {len(channels_config)} 个频道, 单频道超时 {fetch_timeout:.0f}s)..."
         )
+        channel_statuses: dict[str, str] = {}
 
         async def fetch_one(cfg):
+            channel_name = normalize_telegram_channel_name(
+                cfg.get("channel_username", "")
+            )
+            if not channel_name:
+                return []
+
+            effective_cfg = self._get_effective_config(channel_name)
+            interval = effective_cfg["check_interval"]
+            msg_limit = effective_cfg["msg_limit"]
+
+            now = datetime.now().timestamp()
+            last_check = self._channel_last_check.get(channel_name, 0)
+            if now - last_check < interval:
+                return []
+
             try:
-                channel_name = normalize_telegram_channel_name(
-                    cfg.get("channel_username", "")
+                return await asyncio.wait_for(
+                    _perform_fetch(channel_name, effective_cfg, now, interval, msg_limit),
+                    timeout=fetch_timeout,
                 )
-                if not channel_name:
-                    return []
-
-                effective_cfg = self._get_effective_config(channel_name)
-
-                interval = effective_cfg["check_interval"]
-                msg_limit = effective_cfg["msg_limit"]
-
-                # 1. 优先检查抓取间隔，没到时间直接退出，避免无效开销
-                now = datetime.now().timestamp()
-                last_check = self._channel_last_check.get(channel_name, 0)
-                if now - last_check < interval:
-                    return []
-
-                # 2. 到时间了，再获取该频道上次拉取的最后一条消息 ID
-                channel_data = self.storage.get_channel_data(channel_name)
-                last_id = channel_data.get("last_post_id", 0)
-
-                start_date = None
-                s_time = effective_cfg.get("start_time", "")
-                # 只有在 last_id 为 0 (说明从未成功拉取过，需要冷启动) 时，才执行日期转换逻辑
-                if last_id == 0 and s_time:
-                    try:
-                        dt_naive = datetime.strptime(s_time, "%Y-%m-%d")
-                        # 设为北京时间 00:00:00 (UTC+8)
-                        tz_beijing = timezone(timedelta(hours=8))
-                        dt_beijing = dt_naive.replace(tzinfo=tz_beijing)
-                        # 转换为 UTC
-                        start_date = dt_beijing.astimezone(timezone.utc)
-                        logger.debug(
-                            f"[Capture] 频道 {channel_name} 冷启动日期转换: 输入 {s_time} (北京时间) -> 转换为 UTC: {start_date}"
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"[Capture] 频道 {channel_name} 冷启动日期格式错误 '{s_time}': {e}"
-                        )
-                        pass
-
-                lock = self._get_channel_lock(channel_name)
-                if lock.locked():
-                    logger.debug(
-                        f"[Capture] 频道 {channel_name} 正在抓取中，跳过本次。"
-                    )
-                    return []
-
-                async with lock:
-                    if self._stopping:
-                        return []
-                    self._channel_last_check[channel_name] = now
-                    logger.debug(f"[Capture] 正在拉取: {channel_name}")
-                    messages = await self._fetch_channel_messages(
-                        channel_name, start_date, msg_limit
-                    )
-                    monitor_hit_count = 0
-                    monitor_hit_targets = []
-
-                    if messages:
-                        # 先加入队列，再更新 last_id
-                        pending_items = []
-                        for m in messages:
-                            if self._stopping:
-                                return []
-                            is_monitored = self._is_monitor_matched(m, effective_cfg)
-                            if is_monitored:
-                                monitor_hit_count += 1
-                                monitor_hit_targets.append((channel_name, m.id))
-                            pending_items.append(
-                                {
-                                    "id": m.id,
-                                    "time": m.date.timestamp(),
-                                    "grouped_id": m.grouped_id,
-                                    "is_cold_start": (
-                                        last_id == 0 and start_date is not None
-                                    ),
-                                    "is_monitored": is_monitored,
-                                }
-                            )
-
-                        self.storage.add_batch_to_pending_queue(
-                            channel_name, pending_items
-                        )
-
-                        max_id = max(m.id for m in messages)
-                        self.storage.update_last_id(channel_name, max_id)
-
-                        logger.info(
-                            f"[Capture] 频道 {channel_name} 成功拉取 {len(messages)} 条消息 (ID: {max_id})"
-                            + (
-                                f" | 监听命中 {monitor_hit_count} 条"
-                                if monitor_hit_count
-                                else ""
-                            )
-                        )
-                    else:
-                        logger.debug(f"[Capture] 频道 {channel_name} 无新消息。")
-                    return monitor_hit_targets
+            except asyncio.TimeoutError:
+                channel_statuses[channel_name] = "超时"
+                logger.warning(
+                    f"[Capture] 频道 {channel_name} 抓取超时 ({fetch_timeout:.0f}s)。疑似连接假死，触发强制重连。"
+                )
+                await self._safe_force_reconnect("capture_timeout")
+                return []
             except Exception as e:
                 error_msg = str(e)
                 if "database disk image is malformed" in error_msg:
                     logger.error(
-                        f"[Capture] Telethon 数据库文件损坏 (malformed)。可尝试重载插件以恢复..."
+                        f"[Capture] Telethon 数据库文件损坏 (malformed)。正在触发强制重连..."
                     )
-                    session_path = os.path.join(self.plugin_data_dir, "user_session")
-                    from .client import TelegramClientWrapper
-
-                    TelegramClientWrapper.clear_cache(session_path)
+                    await self._safe_force_reconnect("capture_malformed")
                 logger.error(f"[Capture] 检查频道 {cfg} 时出现未捕获异常: {e}")
+                channel_statuses[channel_name] = "异常"
                 import traceback
-
                 logger.error(traceback.format_exc())
                 return []
-            finally:
-                if "channel_name" in locals() and channel_name:
-                    logger.debug(f"[Capture] 频道 {channel_name} 检查任务结束。")
+
+        async def _perform_fetch(channel_name, effective_cfg, now, interval, msg_limit):
+            """执行实际抓取的逻辑"""
+            channel_data = self.storage.get_channel_data(channel_name)
+            last_id = channel_data.get("last_post_id", 0)
+
+            start_date = None
+            s_time = effective_cfg.get("start_time", "")
+            if last_id == 0 and s_time:
+                try:
+                    dt_naive = datetime.strptime(s_time, "%Y-%m-%d")
+                    tz_beijing = timezone(timedelta(hours=8))
+                    dt_beijing = dt_naive.replace(tzinfo=tz_beijing)
+                    start_date = dt_beijing.astimezone(timezone.utc)
+                    logger.debug(
+                        f"[Capture] 频道 {channel_name} 冷启动日期转换: 输入 {s_time} (北京时间) -> 转换为 UTC: {start_date}"
+                    )
+                except Exception as e:
+                    logger.warning(f"[Capture] 频道 {channel_name} 冷启动日期格式错误 '{s_time}': {e}")
+                    pass
+
+            lock = self._get_channel_lock(channel_name)
+            if lock.locked():
+                logger.debug(f"[Capture] 频道 {channel_name} 正在抓取中，跳过本次。")
+                return []
+
+            async with lock:
+                if self._stopping:
+                    return []
+                self._channel_last_check[channel_name] = now
+                
+                messages = await self._fetch_channel_messages(
+                    channel_name, start_date, msg_limit
+                )
+
+                monitor_hit_count = 0
+                monitor_hit_targets = []
+
+                if messages:
+                    pending_items = []
+                    for m in messages:
+                        if self._stopping:
+                            return []
+                        is_monitored = self._is_monitor_matched(m, effective_cfg)
+                        if is_monitored:
+                            monitor_hit_count += 1
+                            monitor_hit_targets.append((channel_name, m.id))
+                        pending_items.append(
+                            {
+                                "id": m.id,
+                                "time": m.date.timestamp(),
+                                "grouped_id": m.grouped_id,
+                                "is_cold_start": (
+                                    last_id == 0 and start_date is not None
+                                ),
+                                "is_monitored": is_monitored,
+                            }
+                        )
+
+                    self.storage.add_batch_to_pending_queue(
+                        channel_name, pending_items
+                    )
+
+                    max_id = max(m.id for m in messages)
+                    self.storage.update_last_id(channel_name, max_id)
+
+                    logger.info(
+                        f"[Capture] 频道 {channel_name} 成功拉取 {len(messages)} 条消息 (ID: {max_id})"
+                        + (
+                            f" | 监听命中 {monitor_hit_count} 条"
+                            if monitor_hit_count
+                            else ""
+                        )
+                    )
+                    channel_statuses[channel_name] = f"✓ {len(messages)} 条"
+                else:
+                    channel_statuses[channel_name] = "–"
+                return monitor_hit_targets
 
         tasks = [fetch_one(cfg) for cfg in channels_config]
         if tasks:
-            monitor_hits = await asyncio.gather(*tasks)
+            # 允许部分失败，防止一个超时导致全部丢失
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            monitor_targets = set()
+            for res in results:
+                if isinstance(res, list):
+                    for item in res:
+                        monitor_targets.add(item)
             if self._stopping:
                 return
-            monitor_targets = set()
-            for hits in monitor_hits:
-                for item in hits:
-                    monitor_targets.add(item)
+            # 汇总本轮检查结果
+            summary_parts = []
+            for name, status in channel_statuses.items():
+                summary_parts.append(f"{name} {status}")
+            if summary_parts:
+                logger.debug(f"[Capture] 检查完毕：{', '.join(summary_parts)}")
             if monitor_targets:
                 logger.info(
                     f"[Monitor] 本轮抓取命中监听规则 {len(monitor_targets)} 条，立即仅转发命中消息。"
@@ -594,6 +645,10 @@ class Forwarder:
             global_cfg = self.config.get("forward_config", {})
 
             batch_limit = global_cfg.get("batch_size_limit", 3)
+            check_interval = global_cfg.get("check_interval", 60)
+            send_interval = global_cfg.get("send_interval", 60)
+            fetch_timeout = max(check_interval * 0.8, 15.0)
+            send_timeout = max(send_interval * 0.8, 15.0)
             retention = global_cfg.get("retention_period", 86400)
             now_ts = datetime.now().timestamp()
 
@@ -763,9 +818,20 @@ class Forwarder:
                 for channel, ids in channel_to_ids.items():
                     try:
                         effective_cfg = self._get_effective_config(channel)
-                        msgs = await self.client.get_messages(
-                            to_telethon_entity(channel), ids=ids
-                        )
+                        try:
+                            msgs = await asyncio.wait_for(
+                                self.client.get_messages(
+                                    to_telethon_entity(channel), ids=ids
+                                ),
+                                timeout=fetch_timeout,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"[Send] 频道 {channel} 消息 re-fetch 超时 ({fetch_timeout:.0f}s)，触发强制重连。"
+                            )
+                            await self._safe_force_reconnect("send_timeout")
+                            break  # 跳出频道循环
+        
                         for m in msgs:
                             if not m:
                                 continue
@@ -869,14 +935,9 @@ class Forwarder:
                         error_msg = str(e)
                         if "database disk image is malformed" in error_msg:
                             logger.error(
-                                f"[Send] Telethon 数据库文件损坏 (malformed)。可尝试重载插件以恢复..."
+                                f"[Send] Telethon 数据库文件损坏 (malformed)。正在触发强制重连..."
                             )
-                            session_path = os.path.join(
-                                self.plugin_data_dir, "user_session"
-                            )
-                            from .client import TelegramClientWrapper
-
-                            TelegramClientWrapper.clear_cache(session_path)
+                            await self._safe_force_reconnect("send_malformed")
                         logger.error(f"[Send] 拉取消息失败 {channel}: {e}")
 
                 # 3. 应用过滤并构建本轮有效的 batches
@@ -940,9 +1001,16 @@ class Forwarder:
 
             actual_sent_count = 0
             try:
-                await self._send_sorted_messages_in_batches(final_batches)
+                await asyncio.wait_for(
+                    self._send_sorted_messages_in_batches(final_batches),
+                    timeout=send_timeout,
+                )
                 for msgs, _ in final_batches:
                     actual_sent_count += len(msgs)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[Send] 转发超时 ({send_timeout:.0f}s)，本轮已终止，未完成消息保留至下次。"
+                )
             except Exception as e:
                 logger.error(f"[Send] 转发过程出现错误: {e}")
             finally:
@@ -1025,7 +1093,10 @@ class Forwarder:
 
                 # 先并发执行所有专属群发送
                 if exclusive_tasks:
-                    await asyncio.gather(*exclusive_tasks, return_exceptions=True)
+                    await asyncio.wait_for(
+                        asyncio.gather(*exclusive_tasks, return_exceptions=True),
+                        timeout=120.0,
+                    )
 
                 # 处理混合大合并
                 if (
@@ -1159,6 +1230,12 @@ class Forwarder:
         """停止转发器工作"""
         self._stopping = True
 
+        # 清理缓存，防止内存泄漏
+        logger.debug(f"[Forwarder] 清理缓存：频道标题 {len(self._channel_titles_cache)} 条，频道锁 {len(self._channel_locks)} 个")
+        self._channel_titles_cache.clear()
+        self._channel_locks.clear()
+        self._channel_last_check.clear()
+
     async def shutdown(self, timeout: float = 10.0) -> None:
         """Wait for running tasks to finish; cancel them if they overrun."""
         self._stopping = True
@@ -1195,9 +1272,6 @@ class Forwarder:
             self.storage.update_last_id(channel_name, 0)
 
         last_id = self.storage.get_channel_data(channel_name)["last_post_id"]
-        logger.debug(
-            f"[Fetch] 频道: {channel_name} | 记录的最新 ID (last_id): {last_id}"
-        )
 
         try:
             if self._stopping:
@@ -1250,39 +1324,56 @@ class Forwarder:
                     "min_id": last_id,
                     "limit": msg_limit,
                 }
-                logger.debug(f"[Fetch] {channel_name}: 增量拉取，ID > {last_id}")
 
-            async for message in self.client.iter_messages(**params):
-                if self._stopping:
-                    break
-                if not message.id:
-                    continue
+            gen = self.client.iter_messages(**params)
+            try:
+                async for message in gen:
+                    if self._stopping:
+                        break
+                    if not message.id:
+                        continue
 
-                # --- 转发查重逻辑 ---
-                if enable_dedup and message.fwd_from and message.fwd_from.from_id:
-                    from telethon.tl.types import PeerChannel
+                    # --- 转发查重逻辑 ---
+                    if enable_dedup and message.fwd_from and message.fwd_from.from_id:
+                        from telethon.tl.types import PeerChannel
 
-                    if isinstance(message.fwd_from.from_id, PeerChannel):
-                        src_channel_id = message.fwd_from.from_id.channel_id
-                        orig_msg_id = message.fwd_from.channel_post
+                        if isinstance(message.fwd_from.from_id, PeerChannel):
+                            src_channel_id = message.fwd_from.from_id.channel_id
+                            orig_msg_id = message.fwd_from.channel_post
 
-                        # 查找该 ID 是否对应我们正在监控的某个频道
-                        src_channel_name = self.storage.get_channel_name_by_id(
-                            src_channel_id
-                        )
-                        if src_channel_name:
-                            # 检查原消息是否已经处理过 (通过比较原频道的 last_post_id)
-                            src_data = self.storage.get_channel_data(src_channel_name)
-                            src_last_id = src_data.get("last_post_id", 0)
+                            # 查找该 ID 是否对应我们正在监控的某个频道
+                            src_channel_name = self.storage.get_channel_name_by_id(
+                                src_channel_id
+                            )
+                            if src_channel_name:
+                                # 检查原消息是否已经处理过 (通过比较原频道的 last_post_id)
+                                src_data = self.storage.get_channel_data(src_channel_name)
+                                src_last_id = src_data.get("last_post_id", 0)
 
-                            if orig_msg_id <= src_last_id:
-                                logger.debug(
-                                    f"[Fetch] 频道 {channel_name} 的消息 {message.id} 是转发自监控频道 {src_channel_name} 的旧消息 (原 ID: {orig_msg_id} <= 已处理 ID: {src_last_id})，自动跳过。"
-                                )
-                                continue
-                # ------------------
+                                if orig_msg_id <= src_last_id:
+                                    logger.debug(
+                                        f"[Fetch] 频道 {channel_name} 的消息 {message.id} 是转发自监控频道 {src_channel_name} 的旧消息 (原 ID: {orig_msg_id} <= 已处理 ID: {src_last_id})，自动跳过。"
+                                    )
+                                    continue
+                    # ------------------
 
-                new_messages.append(message)
+                    new_messages.append(message)
+            finally:
+                try:
+                    if hasattr(gen, 'aclose'):
+                        await asyncio.wait_for(gen.aclose(), timeout=5.0)
+                    else:
+                        await gen.athrow(GeneratorExit)
+                except asyncio.TimeoutError:
+                    logger.warning(f"[Fetch] {channel_name}: 生成器关闭超时，强制终止")
+                    try:
+                        await gen.athrow(GeneratorExit)
+                    except (GeneratorExit, StopAsyncIteration, RuntimeError):
+                        pass
+                except (GeneratorExit, asyncio.CancelledError, StopAsyncIteration):
+                    pass
+                except Exception:
+                    pass
 
             return new_messages
 
@@ -1295,9 +1386,18 @@ class Forwarder:
                     f"[Fetch] {channel_name}: disconnected, reconnect and retry once"
                 )
                 if await self._ensure_client_ready():
-                    return await self._fetch_channel_messages(
-                        channel_name, start_date, msg_limit, _retried=True
-                    )
+                    try:
+                        return await asyncio.wait_for(
+                            self._fetch_channel_messages(
+                                channel_name, start_date, msg_limit, _retried=True
+                            ),
+                            timeout=30.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"[Fetch] {channel_name}: retry also timed out after 30s, giving up"
+                        )
+                        return []
             if "database disk image is malformed" in error_msg:
                 logger.error(
                     f"[Fetch] Telethon 数据库文件损坏 (malformed)。建议重载插件。"

@@ -444,8 +444,21 @@ class PluginCommands:
             return
 
         yield event.plain_result("🔄 正在触发全量检查更新...")
-        asyncio.create_task(self.forwarder.check_updates())
-        asyncio.create_task(self.forwarder.send_pending_messages())
+
+        def _log_on_error(task: asyncio.Task, name: str) -> None:
+            if not task.cancelled() and task.exception():
+                logger.exception(
+                    f"[ForceCheck] task {name} failed: {task.exception()}"
+                )
+
+        t1 = asyncio.create_task(self.forwarder.check_updates())
+        t1.add_done_callback(
+            lambda t: _log_on_error(t, "check_updates")
+        )
+        t2 = asyncio.create_task(self.forwarder.send_pending_messages())
+        t2.add_done_callback(
+            lambda t: _log_on_error(t, "send_pending_messages")
+        )
 
     async def show_status(self, event: AstrMessageEvent):
         """查看插件运行状态（已合并统计信息）"""
