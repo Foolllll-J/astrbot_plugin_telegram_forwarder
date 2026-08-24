@@ -3,32 +3,32 @@
         "description": "QQ 目标会话列表",
         "type": "list",
         "item_type": "string",
-        "hint": "转发到 QQ 会话列表（支持群号，或完整会话名，例如 平台ID:GroupMessage:群号 / 平台ID:FriendMessage:用户ID）",
+        "hint": "所有转发消息默认发送到的 QQ 会话列表。支持群号，或完整会话名（格式：平台ID:GroupMessage:群号 / 平台ID:FriendMessage:用户ID）。留空则不发送到 QQ。",
         "default": []
     },
     "target_channel": {
         "description": "TG 目标频道 ID",
         "type": "string",
-        "hint": "接收消息的频道，例如 @my_channel_name 或 -100xxxxxxx",
+        "hint": "转发到 Telegram 的目标频道，填写频道用户名（如 @my_channel_name）或频道数字 ID（如 -100xxxxxxx）。留空则不转发到 Telegram。",
         "default": ""
     },
     "phone": {
         "description": "手机号",
         "type": "string",
         "default": "",
-        "hint": "登录用的手机号（国际格式，如 +86138...），首次运行时需要"
+        "hint": "Telegram 登录手机号（国际格式，如 +86138xxxxxxxx）。首次登录时需要；也可以直接上传 Session 文件免登录。"
     },
     "api_id": {
         "description": "App API ID",
         "type": "int",
         "default": 0,
-        "hint": "从 my.telegram.org 获取，例如 123456"
+        "hint": "Telegram App API ID，从 my.telegram.org 获取（例如 123456）。首次登录必填。"
     },
     "api_hash": {
         "description": "App API Hash",
         "type": "string",
         "default": "",
-        "hint": "从 my.telegram.org 获取"
+        "hint": "Telegram App API Hash，从 my.telegram.org 获取。首次登录必填。"
     },
     "telegram_session": {
         "type": "file",
@@ -37,12 +37,12 @@
         "file_types": [
             "session"
         ],
-        "hint": "上传 .session 文件以直接登录，避免验证码或人机验证问题，你可以使用本地脚本生成此文件后上传"
+        "hint": "上传已登录的 .session 文件即可免验证码直接登录，避免手机验证码或人机验证问题。留空则使用手机号登录。"
     },
     "proxy": {
         "description": "代理地址",
         "type": "string",
-        "hint": "部分网络环境访问 Telegram 需要代理，例如 http://127.0.0.1:7890",
+        "hint": "访问 Telegram 需要代理时填写代理地址，例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7890。留空表示直连。",
         "default": ""
     },
     "source_channels": {
@@ -60,25 +60,25 @@
                     "start_time": {
                         "type": "string",
                         "description": "起始日期 (YYYY-MM-DD)",
-                        "hint": "留空则仅转发新消息，填具体日期则补发旧消息"
+                        "hint": "补发历史消息的起始日期（YYYY-MM-DD）。留空则只转发新消息；填写日期后将从该日起补发旧消息。"
                     },
                     "check_interval": {
                         "type": "int",
                         "description": "检测间隔 (秒)",
                         "default": 0,
-                        "hint": "该频道专用的检测频率，为 0 时使用全局配置"
+                        "hint": "该频道的独立检测间隔（秒）。设为 0 时沿用全局「检测间隔」。"
                     },
                     "msg_limit": {
                         "type": "int",
                         "description": "单次抓取上限",
                         "default": 10,
-                        "hint": "每次检测最多处理几条消息，建议设为 5~20"
+                        "hint": "单次检测最多抓取的消息条数。建议设为 5~20：过小可能漏消息，过大会增加网络开销。"
                     },
                     "priority": {
                         "type": "int",
                         "description": "优先级",
                         "default": 0,
-                        "hint": "数值越大优先级越高，未设置或为 0 时优先级最低，设置值需 >= 1"
+                        "hint": "转发优先级，数值越大越先发送。未设置或为 0 时优先级最低。"
                     },
                     "exclude_text_on_media": {
                         "description": "媒体消息仅发送媒体",
@@ -89,12 +89,12 @@
                             "关闭"
                         ],
                         "default": "继承全局",
-                        "hint": "开启时，若消息包含媒体则不发送文本；选择‘继承全局’则使用全局配置"
+                        "hint": "开启时，若消息包含媒体则不发送文本内容（含 From 头部）。选择「继承全局」则使用全局配置。"
                     },
                     "forward_types": {
                         "description": "转发消息类型",
                         "type": "list",
-                        "hint": "选择需要搬运的消息类型，全不选表示不搬运任何消息",
+                        "hint": "勾选需要搬运的消息类型，全部不勾选则不搬运任何消息。",
                         "options": [
                             "文字",
                             "图片",
@@ -114,26 +114,26 @@
                         "description": "文件大小限制 (MB)",
                         "type": "float",
                         "default": 0,
-                        "hint": "除图片外的媒体大小限制，0 表示不限制"
+                        "hint": "除图片外其他媒体的文件大小上限（MB）。设为 0 表示不限制。"
                     },
                     "ignore_global_filters": {
                         "description": "忽略全局文本过滤",
                         "type": "bool",
                         "default": false,
-                        "hint": "开启后，该频道将忽略全局的过滤规则（但仍执行本频道自己的过滤规则）。常用于白名单式频道或重要通知频道。"
+                        "hint": "开启后，该频道将忽略全局的过滤关键词/正则，但仍执行本频道自己的过滤规则。适用于白名单式或重要通知频道。"
                     },
                     "filter_keywords": {
                         "type": "list",
                         "item_type": "string",
                         "description": "过滤关键词",
                         "default": [],
-                        "hint": "包含这些关键词的消息将被丢弃"
+                        "hint": "本频道专属过滤关键词，命中任一关键词的消息将被丢弃。"
                     },
                     "filter_regex": {
                         "type": "string",
                         "description": "正则过滤",
                         "default": "",
-                        "hint": "Python 正则表达式过滤"
+                        "hint": "本频道专属正则过滤规则（Python re 语法），命中则丢弃。"
                     },
                     "filter_spoiler_messages": {
                         "description": "过滤遮罩/剧透消息",
@@ -144,7 +144,7 @@
                             "关闭"
                         ],
                         "default": "继承全局",
-                        "hint": "开启后，带有 Telegram 剧透标记（文本或媒体）的消息将被跳过"
+                        "hint": "开启后，带有 Telegram 剧透标记（文本剧透实体或媒体剧透标记）的消息将被跳过。选择「继承全局」则使用全局配置。"
                     },
                     "strip_markdown_links": {
                         "description": "剥离 Markdown 链接，只保留文本",
@@ -155,27 +155,27 @@
                             "关闭"
                         ],
                         "default": "继承全局",
-                        "hint": "开启后该频道 [文本](链接) 只保留文本"
+                        "hint": "开启后，该频道的 [文本](链接) 仅保留「文本」部分，链接被丢弃。"
                     },
                     "monitor_keywords": {
                         "type": "list",
                         "item_type": "string",
                         "description": "监听关键词",
                         "default": [],
-                        "hint": "命中后会立即触发转发"
+                        "hint": "本频道专属监听关键词，命中任一关键词的消息将立即转发，不等待发送周期。"
                     },
                     "monitor_regex": {
                         "type": "string",
                         "description": "监听正则",
                         "default": "",
-                        "hint": "命中后会立即触发转发"
+                        "hint": "本频道专属监听正则（Python re 语法），命中后立即触发转发。"
                     },
                     "target_qq_sessions": {
                         "description": "该频道专属 QQ 目标会话列表",
                         "type": "list",
                         "item_type": "string",
                         "default": [],
-                        "hint": "填写则覆盖全局 QQ 目标会话（支持群号或完整会话名） 留空使用全局配置"
+                        "hint": "填写后，该频道仅发送到这里的 QQ 会话，覆盖全局配置（支持群号或完整会话名）。留空则使用全局 QQ 目标。"
                     }
                 }
             }
@@ -208,59 +208,64 @@
     "forward_config": {
         "type": "object",
         "description": "全局转发配置",
-        "hint": "配置全局转发配置与过滤规则",
+        "hint": "配置全局转发规则、发送节奏与过滤规则",
         "items": {
             "qq_merge_threshold": {
-                "description": "QQ 大合并",
+                "description": "QQ 大合并阈值",
                 "type": "int",
                 "default": 0,
-                "hint": "本次要发的消息数 ≥ 此值时，全部打包成一条合并转发消息。设为 ≤1 则永不触发大合并。推荐 5~10。注意：此值必须 ≤「单次发送消息批次上限」，否则永远不会触发"
+                "hint": "当单次要发送的消息数 ≥ 此值时，打包成一条 QQ 合并转发消息发出。设为 ≤1 表示永不合并；建议 5~10。注意：此值必须 ≤「单次发送消息批次上限」，否则永不触发。"
             },
             "qq_big_merge_mode": {
-                "description": "QQ 大合并的聚合范围",
+                "description": "QQ 大合并聚合范围",
                 "type": "string",
                 "options": [
                     "独立频道",
                     "混合所有频道",
                     "关闭"
                 ],
+                "labels": [
+                    "独立频道",
+                    "混合所有频道",
+                    "关闭"
+                ],
                 "default": "独立频道",
-                "hint": "『独立频道』：每个频道独立判断是否合并（推荐）；『混合所有频道』：所有频道消息总数达标才合并成一条超大转发；『关闭』强制不使用大合并"
+                "hint": "「独立频道」：每个频道独立判断是否合并（推荐）；「混合所有频道」：所有频道消息总数达标才合并成一条超大转发；「关闭」强制不使用大合并。"
             },
             "use_channel_title": {
                 "type": "bool",
                 "default": true,
                 "description": "显示频道标题",
-                "hint": "开启时，From 头部将显示频道名称而非 ID"
+                "hint": "开启后，From 头部显示频道名称而非频道 ID/用户名。"
             },
             "enable_deduplication": {
                 "type": "bool",
                 "default": true,
                 "description": "转发查重",
-                "hint": "开启时，如果频道 A 转发了频道 B 的消息，且频道 B 也在监控列表中，则频道 A 的这条转发消息将被自动跳过，避免重复发送"
+                "hint": "开启后，若监控中的频道 A 转发了同样在监控列表中的频道 B 的消息，则 A 的这条转发会被自动跳过，避免重复发送。"
             },
             "exclude_text_on_media": {
                 "description": "媒体消息仅发送媒体",
                 "type": "bool",
                 "default": false,
-                "hint": "如果消息包含媒体（图片、音频、视频、文件等），则不发送文本说明内容（包含标题和 From 头部）"
+                "hint": "开启后，包含媒体（图片/视频/音频/文件）的消息将不再发送文本内容（含标题和 From 头部）。"
             },
             "filter_spoiler_messages": {
                 "description": "过滤遮罩/剧透消息",
                 "type": "bool",
                 "default": false,
-                "hint": "开启后，带有 Telegram 剧透标记（文本或媒体）的消息将被跳过"
+                "hint": "开启后，带有 Telegram 剧透标记（文本剧透实体或媒体剧透标记）的消息将被跳过。"
             },
             "strip_markdown_links": {
                 "description": "剥离 Markdown 链接，只保留文本",
                 "type": "bool",
                 "default": false,
-                "hint": "开启后，[文本](链接) 只保留「文本」，链接部分被完全丢弃"
+                "hint": "开启后，[文本](链接) 只保留「文本」部分，链接被完全丢弃。"
             },
             "forward_types": {
                 "description": "转发消息类型",
                 "type": "list",
-                "hint": "选择需要搬运的消息类型，全不选表示不搬运任何消息",
+                "hint": "勾选需要搬运的消息类型，全部不勾选则不搬运任何消息。",
                 "options": [
                     "文字",
                     "图片",
@@ -280,23 +285,29 @@
                 "description": "文件大小限制 (MB)",
                 "type": "float",
                 "default": 0,
-                "hint": "除图片外的媒体（音频、视频、文件）大小限制。0 表示不限制。"
+                "hint": "除图片外的媒体（音频/视频/文件）大小上限（MB）。设为 0 表示不限制。"
             },
             "check_interval": {
-                "description": "检测间隔(秒)",
+                "description": "检测间隔 (秒)",
                 "type": "int",
-                "hint": "每隔多少秒检查一次新消息",
+                "hint": "每隔多少秒检查一次各频道的 Telegram 新消息。",
                 "default": 60
             },
             "send_interval": {
                 "type": "int",
                 "default": 60,
                 "description": "发送执行间隔 (秒)",
-                "hint": "从待发送队列中提取消息并执行转发的周期"
+                "hint": "每隔多少秒从待发送队列中提取消息并执行转发。"
+            },
+            "send_random_delay_minutes": {
+                "description": "发送随机延迟上限 (分钟)",
+                "type": "int",
+                "default": 0,
+                "hint": "每次发送周期开始前随机等待 0~N 分钟，实际延迟不会超过发送周期。设为 0 禁用。"
             },
             "batch_size_limit": {
                 "description": "单次发送消息批次上限",
-                "hint": "每批次发送时单次消息数量上限。此值必须 ≥「QQ 大合并」阈值，否则大合并永远不会触发。推荐 10",
+                "hint": "每次发送周期最多发送的消息条数上限。此值必须 ≥「QQ 大合并」阈值，否则大合并永不触发。建议 10。",
                 "type": "int",
                 "slider": {
                     "min": 1,
@@ -307,13 +318,13 @@
             },
             "retention_period": {
                 "description": "消息保留时间 (秒)",
-                "hint": "超过此时间的消息在发送前将被丢弃",
+                "hint": "待发消息在队列中的最大保留时间，超过该时间的消息在发送前将被丢弃。",
                 "type": "int",
                 "default": 86400
             },
             "curfew_time": {
                 "description": "宵禁时间段",
-                "hint": "在此时间段内将跳过拉取和转发。格式如 23:00-07:00 (支持跨天)。留空禁用。",
+                "hint": "在此时间段内停止抓取与转发，例如 23:00-07:00（支持跨天）。留空禁用。",
                 "type": "string",
                 "default": ""
             },
@@ -322,26 +333,26 @@
                 "item_type": "string",
                 "description": "过滤关键词",
                 "default": [],
-                "hint": "包含这些关键词的消息将被丢弃"
+                "hint": "全局过滤关键词，命中任一关键词的 Telegram 消息将被丢弃。"
             },
             "filter_regex": {
                 "type": "string",
                 "description": "正则过滤",
                 "default": "",
-                "hint": "Python 正则表达式过滤。留空则不启用。"
+                "hint": "全局正则过滤规则（Python re 语法），命中即丢弃。留空则不启用。"
             },
             "monitor_keywords": {
                 "type": "list",
                 "item_type": "string",
                 "description": "监听关键词",
                 "default": [],
-                "hint": "命中后会立即触发转发"
+                "hint": "全局监听关键词，命中任一关键词的消息将立即转发，不等待发送周期。"
             },
             "monitor_regex": {
                 "type": "string",
                 "description": "监听正则",
                 "default": "",
-                "hint": "命中后会立即触发转发"
+                "hint": "全局监听正则（Python re 语法），命中后立即触发转发。"
             }
         }
     },
@@ -357,7 +368,7 @@
                     "channel": {
                         "type": "string",
                         "description": "频道用户名 (不带@)",
-                        "hint": "例如: SomeACG"
+                        "hint": "要应用该合并规则的频道用户名（不带 @）。"
                     },
                     "rule_class": {
                         "type": "string",
@@ -366,8 +377,12 @@
                             "",
                             "SomeACGPreviewPlusOriginal"
                         ],
+                        "labels": [
+                            "不使用",
+                            "SomeACG 预览图+原图合并"
+                        ],
                         "default": "",
-                        "hint": "选择合并规则类。SomeACGPreviewPlusOriginal: 合并预览图说明+原图"
+                        "hint": "选择合并规则类型。SomeACGPreviewPlusOriginal：将「预览图说明 + 原图」合并为一条消息。"
                     },
                     "params": {
                         "type": "object",
@@ -377,7 +392,7 @@
                                 "type": "int",
                                 "description": "时间窗口 (秒)",
                                 "default": 10,
-                                "hint": "关联消息的最大时间差（默认10秒）"
+                                "hint": "判定为同一组消息的最大时间间隔（秒）。"
                             }
                         },
                         "default": {

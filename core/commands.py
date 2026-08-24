@@ -855,6 +855,7 @@ class PluginCommands:
             help_items = [
                 ("check_interval", "检测新消息的间隔（秒，默认60）"),
                 ("send_interval", "从待发队列实际发送的间隔（秒，默认60）"),
+                ("send_random_delay_minutes", "发送随机延迟上限（分钟，每次发送前随机等0~N分钟，0=禁用）"),
                 ("batch_size_limit", "单次发送最多几条消息（建议1~20，默认3）"),
                 ("qq_merge_threshold", "QQ 合并转发阈值（≥此值打包合并，≤1=永不合并）"),
                 ("retention_period", "待发消息最长保留时间（秒，超期丢弃，默认86400）"),
@@ -954,6 +955,7 @@ class PluginCommands:
             mapping = {
                 "check_interval": "数字（秒），例如 60、120",
                 "send_interval": "数字（秒），例如 60",
+                "send_random_delay_minutes": "数字（分钟，0=禁用），例如 5",
                 "batch_size_limit": "数字（建议1~20），例如 5",
                 "qq_merge_threshold": "数字（≤1不合并），例如 8",
                 "retention_period": "秒数，例如 86400",
@@ -1331,6 +1333,7 @@ class PluginCommands:
             "check_interval": int,
             "msg_limit": int,
             "send_interval": int,
+            "send_random_delay_minutes": int,
             "qq_merge_threshold": int,
             "batch_size_limit": int,
             "retention_period": int,

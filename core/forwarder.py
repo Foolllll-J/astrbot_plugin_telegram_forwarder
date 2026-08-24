@@ -1,5 +1,6 @@
 import asyncio
 import os
+import random
 import re
 from contextlib import suppress
 from datetime import datetime, timezone, timedelta
@@ -736,6 +737,24 @@ class Forwarder:
                 )
 
             valid_pending.sort(key=sorting_key)
+
+            # 发送随机延迟
+            random_delay_minutes = global_cfg.get("send_random_delay_minutes", 0)
+            if not force_immediate and random_delay_minutes and random_delay_minutes > 0:
+                max_delay = min(int(random_delay_minutes) * 60, send_interval)
+                if random_delay_minutes * 60 > send_interval:
+                    logger.warning(
+                        f"[Send] send_random_delay_minutes={random_delay_minutes} 分钟超过发送周期 "
+                        f"send_interval={send_interval}s，实际随机延迟已钳制为 0~{max_delay}s。"
+                    )
+                delay_seconds = random.uniform(0, max_delay)
+                logger.debug(f"[Send] 随机延迟 {delay_seconds:.1f}s 后开始发送。")
+                await asyncio.sleep(delay_seconds)
+
+                # 延迟等待期间可能收到停止信号（插件重载/关闭），放弃本次发送
+                if self._stopping:
+                    logger.debug("[Send] 随机延迟期间收到停止信号，放弃本次发送。")
+                    return
 
             logger.debug(f"[Send] 开始处理待发送队列 (批次上限: {batch_limit})")
 
